@@ -1,0 +1,71 @@
+# Pre-commit template for Python agent-readiness baseline.
+# Copy to `.pre-commit-config.yaml` to activate, then run:
+#   uvx pre-commit install
+#   uvx pre-commit run --all-files
+minimum_pre_commit_version: "4.0.0"
+exclude: ^(\.venv/|venv/|\.pytest_cache/|\.ruff_cache/|.*__pycache__/)
+
+repos:
+  # Generic repository hygiene (includes large file detection).
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-added-large-files
+        args: ["--maxkb=500"]
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: check-yaml
+      - id: check-toml
+
+  # Python ecosystem checks, all executed through `uvx`.
+  - repo: local
+    hooks:
+      # formatter -> ruff
+      - id: ruff-format
+        name: Ruff format
+        entry: uvx ruff format
+        language: system
+        types_or: [python, pyi]
+
+      # lint_config + naming_consistency + cyclomatic_complexity + tech_debt_tracking -> ruff
+      - id: ruff-check
+        name: Ruff lint
+        entry: uvx ruff check --fix
+        language: system
+        types_or: [python, pyi]
+
+      # type_check (+ strict typing where applicable) -> ty
+      - id: ty-check
+        name: Ty type check
+        entry: uvx ty check
+        language: system
+        pass_filenames: false
+
+      # dead_code_detection -> vulture
+      - id: vulture
+        name: Vulture dead code
+        entry: uvx vulture src tests --min-confidence 80
+        language: system
+        pass_filenames: false
+
+      # duplicate_code_detection + file_size + function_size -> pylint checks
+      - id: pylint-quality
+        name: Pylint quality checks
+        entry: uvx pylint --disable=all --enable=duplicate-code,too-many-lines,too-many-statements --min-similarity-lines=8 --max-module-lines=500 --max-statements=50 src tests
+        language: system
+        pass_filenames: false
+
+      # unused_dependencies_detection -> deptry
+      - id: deptry
+        name: Deptry unused dependencies
+        entry: uvx deptry .
+        language: system
+        pass_filenames: false
+
+      # secret scanner -> detect-secrets
+      - id: detect-secrets
+        name: Detect secrets
+        entry: uvx --from detect-secrets detect-secrets-hook
+        language: system
+        pass_filenames: true
+        exclude: ^\.agents/

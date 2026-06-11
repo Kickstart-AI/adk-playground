@@ -1,0 +1,66 @@
+[project]
+name = "adk-playground"
+version = "0.1.0"
+description = "Python playground for Google Agent Development Kit experiments."
+requires-python = ">=3.14"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "pytest==9.0.3",
+    "ruff==0.15.12",
+    "ty==0.0.35",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+src = ["src", "tests"]
+extend-exclude = [".venv", "venv", "build", "dist", ".ruff_cache", ".pytest_cache"]
+
+[tool.ruff.lint]
+select = [
+    "E",
+    "F",
+    "I",
+    "N",
+    "UP",
+    "B",
+    "C4",
+    "SIM",
+    "C90",
+    "PL",
+    "RUF",
+    "TID252",
+]
+ignore = ["PLR2004"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
+
+[tool.ruff.lint.pylint]
+max-statements = 50
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
+docstring-code-format = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ty.terminal]
+output-format = "concise"
+error-on-warning = true
+
+[tool.ty.src]
+respect-ignore-files = true
+exclude = [".venv", "venv", "build", "dist", ".ruff_cache", ".pytest_cache"]
+
+[tool.ty.analysis]
+respect-type-ignore-comments = true
+
+[tool.uv]
+exclude-newer = "30 days"
