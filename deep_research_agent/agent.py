@@ -1,33 +1,19 @@
 """Python ADK definition for the deep research agent."""
 
 import asyncio
-import os
 
-import mlflow
 from google.adk import Workflow
 from google.adk.agents.llm_agent import Agent
 from google.adk.tools import google_search, url_context
 from google.adk.workflow import node
 from google.genai import types
-from mlflow.entities import MlflowExperimentLocation
-from opentelemetry import trace
-from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from langfuse import get_client, observe, propagate_attributes
+from openinference.instrumentation.google_adk import GoogleADKInstrumentor
 from pydantic import BaseModel, Field
 
-# Configure the tracer provider and add the exporter
-tracer_provider = TracerProvider()
-tracer_provider.add_span_processor(SimpleSpanProcessor(OTLPSpanExporter()))
-trace.set_tracer_provider(tracer_provider)
-os.environ["MLFLOW_USE_DEFAULT_TRACER_PROVIDER"] = "false"
+langfuse = get_client()
+GoogleADKInstrumentor().instrument()
 
-mlflow.gemini.autolog()
-
-# Set a tracking URI and an experiment
-mlflow.set_tracking_uri("http://127.0.0.1:5001")
-exp_id = mlflow.set_experiment("Google-ADK").experiment_id
-mlflow.tracing.set_destination(MlflowExperimentLocation(exp_id))
 MODEL = "gemini-3.5-flash"
 
 
@@ -91,31 +77,49 @@ writer_agent = Agent(
 
 
 @node(rerun_on_resume=True)
+@observe(
+    name="deep-research-workflow",
+    as_type="chain",
+    capture_input=False,
+    capture_output=True,
+)
 async def deep_research_workflow(ctx, node_input) -> str:
     """Run planner, dynamic researcher fan-out, and writer."""
-    plan = await ctx.run_node(planner_agent, node_input)
-    plan = ResearchPlan.model_validate(plan)
-    if not plan.ready_to_research:
-        return "\n".join(plan.clarifying_questions)
-
-    research_tasks = [
-        ctx.run_node(
-            researcher_agent,
-            {"research_goal": plan.research_goal, "subtask": subtask},
-            run_id=f"research-{index}",
+    with propagate_attributes(
+        trace_name="deep-research-workflow",
+        tags=["google-adk", "deep-research"],
+        metadata={"agent": "deep_research_agent", "model": MODEL},
+    ):
+        langfuse.update_current_span(
+            input={"request": node_input},
+            metadata={"workflow": "planner-researcher-writer"},
         )
-        for index, subtask in enumerate(plan.subtasks)
-    ]
-    findings = await asyncio.gather(*research_tasks)
+        try:
+            plan = await ctx.run_node(planner_agent, node_input)
+            plan = ResearchPlan.model_validate(plan)
+            if not plan.ready_to_research:
+                return "\n".join(plan.clarifying_questions)
 
-    return await ctx.run_node(
-        writer_agent,
-        {
-            "research_goal": plan.research_goal,
-            "subtasks": plan.subtasks,
-            "findings": findings,
-        },
-    )
+            research_tasks = [
+                ctx.run_node(
+                    researcher_agent,
+                    {"research_goal": plan.research_goal, "subtask": subtask},
+                    run_id=f"research-{index}",
+                )
+                for index, subtask in enumerate(plan.subtasks)
+            ]
+            findings = await asyncio.gather(*research_tasks)
+
+            return await ctx.run_node(
+                writer_agent,
+                {
+                    "research_goal": plan.research_goal,
+                    "subtasks": plan.subtasks,
+                    "findings": findings,
+                },
+            )
+        finally:
+            langfuse.flush()
 
 
 root_agent = Workflow(

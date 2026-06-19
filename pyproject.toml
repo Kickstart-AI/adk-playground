@@ -5,9 +5,8 @@ description = "Python playground for Google Agent Development Kit experiments."
 requires-python = ">=3.14"
 dependencies = [
     "google-adk[otel-gcp]==2.0.0",
-    "mlflow>=3.12.0",
-    "opentelemetry-exporter-otlp-proto-grpc>=1.41.1",
-    "opentelemetry-exporter-otlp-proto-http>=1.41.1",
+    "langfuse==4.6.1",
+    "openinference-instrumentation-google-adk==0.1.14",
     "pydantic==2.12.5",
 ]
 
@@ -69,5 +68,4 @@ exclude-newer = "30 days"
 
 [tool.deptry.package_module_name_map]
 google-adk = "google"
-opentelemetry-exporter-otlp-proto-grpc = "opentelemetry"
-opentelemetry-exporter-otlp-proto-http = "opentelemetry"
+openinference-instrumentation-google-adk = "openinference"
