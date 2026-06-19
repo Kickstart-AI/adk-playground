@@ -55,6 +55,25 @@ Then edit `my_agent/.env` and set `GOOGLE_API_KEY`.
 
 Commit `.env.example`. Do not commit `.env`.
 
+## Set up Langfuse
+
+Start the local Langfuse stack:
+
+```bash
+docker compose up
+```
+
+Open `http://localhost:3000`, create or select a project, and create API keys in
+the web interface.
+
+Set the keys in the agent `.env` file:
+
+```env
+LANGFUSE_PUBLIC_KEY=pk-lf-...
+LANGFUSE_SECRET_KEY=sk-lf-...
+LANGFUSE_BASE_URL=http://localhost:3000
+```
+
 ## Start an agent
 
 Run the current agent in the terminal:
