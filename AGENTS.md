@@ -47,3 +47,4 @@
 
 ## Documentation & Memory
 - Avoid overdocumenting (e.g. README.md in every folder, excessive comments in the code).
+- Document agent-specific behavior, decisions, and learnings in that agent's `README.md`.

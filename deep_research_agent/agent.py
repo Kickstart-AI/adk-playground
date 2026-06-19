@@ -3,6 +3,7 @@
 import asyncio
 
 from google.adk import Workflow
+from google.adk.agents import context
 from google.adk.agents.llm_agent import Agent
 from google.adk.tools import google_search, url_context
 from google.adk.workflow import node
@@ -83,7 +84,7 @@ writer_agent = Agent(
     capture_input=False,
     capture_output=True,
 )
-async def deep_research_workflow(ctx, node_input) -> str:
+async def deep_research_workflow(ctx: context.Context, node_input) -> str:
     """Run planner, dynamic researcher fan-out, and writer."""
     with propagate_attributes(
         trace_name="deep-research-workflow",
@@ -95,7 +96,23 @@ async def deep_research_workflow(ctx, node_input) -> str:
             metadata={"workflow": "planner-researcher-writer"},
         )
         try:
-            plan = await ctx.run_node(planner_agent, node_input)
+            # ADK single-turn workflow nodes do not receive chat history.
+            history = [
+                {
+                    "author": event.author,
+                    "text": "\n".join(part.text for part in event.content.parts or [] if part.text),
+                }
+                for event in ctx.session.events
+                if event.content and event.author in {"user", "Planner_Agent", "Writer_Agent"}
+            ]
+
+            plan = await ctx.run_node(
+                planner_agent,
+                {
+                    "conversation_history": history,
+                    "current_request": node_input.model_dump(),
+                },
+            )
             plan = ResearchPlan.model_validate(plan)
             if not plan.ready_to_research:
                 return "\n".join(plan.clarifying_questions)
