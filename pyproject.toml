@@ -3,7 +3,13 @@ name = "adk-playground"
 version = "0.1.0"
 description = "Python playground for Google Agent Development Kit experiments."
 requires-python = ">=3.14"
-dependencies = []
+dependencies = [
+    "google-adk[otel-gcp]==2.0.0",
+    "mlflow>=3.12.0",
+    "opentelemetry-exporter-otlp-proto-grpc>=1.41.1",
+    "opentelemetry-exporter-otlp-proto-http>=1.41.1",
+    "pydantic==2.12.5",
+]
 
 [dependency-groups]
 dev = [
@@ -15,7 +21,7 @@ dev = [
 [tool.ruff]
 line-length = 100
 target-version = "py314"
-src = ["src", "tests"]
+src = ["deep_research_agent"]
 extend-exclude = [".venv", "venv", "build", "dist", ".ruff_cache", ".pytest_cache"]
 
 [tool.ruff.lint]
@@ -47,10 +53,6 @@ indent-style = "space"
 line-ending = "lf"
 docstring-code-format = true
 
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-pythonpath = ["src"]
-
 [tool.ty.terminal]
 output-format = "concise"
 error-on-warning = true
@@ -64,3 +66,8 @@ respect-type-ignore-comments = true
 
 [tool.uv]
 exclude-newer = "30 days"
+
+[tool.deptry.package_module_name_map]
+google-adk = "google"
+opentelemetry-exporter-otlp-proto-grpc = "opentelemetry"
+opentelemetry-exporter-otlp-proto-http = "opentelemetry"

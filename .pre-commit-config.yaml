@@ -44,14 +44,14 @@ repos:
       # dead_code_detection -> vulture
       - id: vulture
         name: Vulture dead code
-        entry: uvx vulture src tests --min-confidence 80
+        entry: uvx vulture deep_research_agent --min-confidence 80
         language: system
         pass_filenames: false
 
       # duplicate_code_detection + file_size + function_size -> pylint checks
       - id: pylint-quality
         name: Pylint quality checks
-        entry: uvx pylint --disable=all --enable=duplicate-code,too-many-lines,too-many-statements --min-similarity-lines=8 --max-module-lines=500 --max-statements=50 src tests
+        entry: uvx pylint --disable=all --enable=duplicate-code,too-many-lines,too-many-statements --min-similarity-lines=8 --max-module-lines=500 --max-statements=50 deep_research_agent
         language: system
         pass_filenames: false
 
