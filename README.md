@@ -63,7 +63,7 @@ Start the local Langfuse stack:
 docker compose up
 ```
 
-Open `http://localhost:3000`, create or select a project, and create API keys in
+Open `http://localhost:3033`, create or select a project, and create API keys in
 the web interface.
 
 Set the keys in the agent `.env` file:
@@ -71,7 +71,7 @@ Set the keys in the agent `.env` file:
 ```env
 LANGFUSE_PUBLIC_KEY=pk-lf-...
 LANGFUSE_SECRET_KEY=sk-lf-...
-LANGFUSE_BASE_URL=http://localhost:3000
+LANGFUSE_BASE_URL=http://localhost:3033
 ```
 
 ## Start an agent
