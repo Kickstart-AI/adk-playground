@@ -20,7 +20,7 @@ dev = [
 [tool.ruff]
 line-length = 100
 target-version = "py314"
-src = ["deep_research_agent"]
+src = ["deep_research_agent", "recursive_agent"]
 extend-exclude = [".venv", "venv", "build", "dist", ".ruff_cache", ".pytest_cache"]
 
 [tool.ruff.lint]
