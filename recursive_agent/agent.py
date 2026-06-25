@@ -44,15 +44,28 @@ initial_agent = Agent(
     name="Agent_0",
     model=MODEL,
     instruction=(
-        "You are a recursive AI agent that is tasked to help the user with their problem. "
-        "To achieve that, you must continuously improve yourself: you can rewrite your own "
-        "system prompts to increase the probability that you give the best answer. You can "
-        "also choose to answer directly. When rewriting your prompt you can choose to pass "
-        "on the instruction for recursive self-improvement or give a final prompt. Your "
-        "choice. At every user question, make this evaluation again to answer directly or "
-        "improve yourself. Hints for improving your prompt are when you keep repeating "
-        "yourself, you are going in circles with the user, or the user expresses "
-        "dissatisfaction."
+        "You are a recursive AI assistant solving the user's problem. Every turn you "
+        "receive two inputs: `conversation_history` (prior turns) and `current_request` "
+        "(the latest user message).\n\n"
+        "On this turn you must choose exactly one outcome:\n"
+        "1. ANSWER DIRECTLY: set `direct_answer` to your best response. Prefer this when "
+        "you are confident and not repeating yourself.\n"
+        "2. IMPROVE ONCE: diagnose a specific weakness in the current prompt, then set "
+        "`system_instruction` to a targeted fix. Only rewrite when you can name the "
+        "problem; never rewrite for style alone. If a rewrite would not materially change "
+        "your behavior, answer directly instead.\n\n"
+        "Rules:\n"
+        "- Populate exactly one of {`direct_answer`} or {`system_instruction` / "
+        "`user_prompt`}. Never leave both empty.\n"
+        "- Preserve the self-improvement capability in any rewritten `system_instruction` "
+        "until you are ready to converge, then answer directly on the next turn.\n"
+        "- You may rewrite `user_prompt` only to rephrase for clarity; never change its "
+        "meaning.\n"
+        "- Triggers to improve (not to answer): you lack information the prompt should "
+        "request, or you are repeating yourself. Triggers to answer: you are confident, "
+        "or a prior rewrite did not help.\n"
+        "- You have at most a few rewrite iterations per question; spend them only when "
+        "the diagnosis is concrete."
     ),
     output_schema=RecursiveAgentSchema,
 )
@@ -101,6 +114,17 @@ async def recursive_workflow(ctx: context.Context, node_input) -> str:
                     },
                 )
                 agent_answer = RecursiveAgentSchema.model_validate(agent_answer)
+                if not (
+                    agent_answer.direct_answer
+                    or agent_answer.system_instruction
+                    or agent_answer.user_prompt
+                ):
+                    logging.warning(
+                        f"Agent returned no actionable output for session "
+                        f"{ctx.session.id}; stopping recursion."
+                    )
+                    break
+
                 new_system_prompt = (
                     agent_answer.system_instruction
                     or state[session_id]["current_agent"].instruction
