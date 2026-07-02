@@ -7,6 +7,7 @@ from google.adk import Context, Workflow
 from google.adk import tools as adk_tools
 from google.adk.agents import LlmAgent, context
 from google.adk.agents.llm_agent import Agent
+from google.adk.code_executors import BuiltInCodeExecutor
 from google.adk.workflow import node
 from langfuse import get_client, observe, propagate_attributes
 from openinference.instrumentation.google_adk import GoogleADKInstrumentor
@@ -28,15 +29,27 @@ COMMON_AGENT_INSTRUCTION = (
     "when you can name a concrete weakness in the current agent and a rewrite is likely "
     "to improve the next attempt.\n\n"
     "When improving, `agent_schema` must include `name`, `description`, and "
-    "`instruction`. It may include `model`, `tools`, and `sub_agents`. Use `user_prompt` "
-    "only with `agent_schema`, and only to rephrase the request without changing its "
-    "meaning. Preserve this recursive self-improvement contract in rewritten top-level "
-    "agent instructions until you are ready to converge.\n\n"
+    "`instruction`. It may include `model`, `tools`, `code_execution`, and "
+    "`sub_agents`. Use `user_prompt` only with `agent_schema`, and only to rephrase "
+    "the request without changing its meaning. Preserve this recursive "
+    "self-improvement contract in rewritten top-level agent instructions until you "
+    "are ready to converge.\n\n"
     "When improving, prefer defining focused sub-agents if the request has separable "
     "parts, needs multiple specialist perspectives, benefits from independent "
     "verification, or requires research across different domains. Keep sub-agents "
     "narrow and give each one a clear description and instruction. Do not create "
     "sub-agents for simple requests where one agent can answer directly.\n\n"
+    "Available tools: `google_search` returns search result links, snippets, and "
+    "metadata for web discovery or verification. `url_context` fetches the context "
+    "of a specific URL when the URL is known or provided. Use the smallest useful "
+    "tool set, and do not include tools for simple requests that can be answered "
+    "directly. Set `code_execution` to true only when the agent needs model-internal "
+    "code execution for computation, data analysis, algorithmic checking, or small "
+    "code experiments. Do not use code execution for unsafe operations, secrets, "
+    "package installs, network activity, file deletion, or environment changes.\n\n"
+    "Capabilities are not inherited implicitly. When creating a follow-up "
+    "`agent_schema` or any `sub_agents`, explicitly include the tools and "
+    "`code_execution` setting each agent needs.\n\n"
     "Never populate both `direct_answer` and `agent_schema`. Never leave both empty. "
     "If required information is missing, ask a concise clarifying question in "
     "`direct_answer`."
@@ -67,6 +80,19 @@ class AgentSchema(BaseModel):
     )
     tools: list[AgentTool] = Field(
         default_factory=list,
+        description=(
+            "Optional tools. `google_search` returns search result links, snippets, "
+            "and metadata. `url_context` fetches the context of a specific URL."
+        ),
+    )
+    code_execution: bool = Field(
+        default=False,
+        description=(
+            "Set true to enable BuiltInCodeExecutor for computation, data analysis, "
+            "algorithmic checking, or small code experiments. Do not enable for "
+            "unsafe operations, secrets, installs, network activity, file deletion, "
+            "or environment changes."
+        ),
     )
 
 
@@ -210,12 +236,16 @@ async def construct_agent(agent_schema: AgentSchema, iteration) -> LlmAgent:
 def construct_agent_kwargs(agent_kwargs: dict) -> dict:
     tools = agent_kwargs.pop("tools")
     tools = [getattr(adk_tools, tool) for tool in tools]
+    code_execution = agent_kwargs.pop("code_execution")
 
     if tools:
         agent_kwargs["tools"] = tools
         agent_kwargs["generate_content_config"] = {
             "tool_config": {"include_server_side_tool_invocations": True}
         }
+
+    if code_execution:
+        agent_kwargs["code_executor"] = BuiltInCodeExecutor()
 
     if agent_kwargs.get("sub_agents"):
         sub_agents = []
