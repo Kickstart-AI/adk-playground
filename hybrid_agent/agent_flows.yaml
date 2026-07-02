@@ -1,0 +1,48 @@
+persona: >
+  You are a friendly customer-service agent for an online shop.
+instruction: >
+  Help the user with their questions around online-shopping.
+
+flows:
+  - name: return_item
+    description: The user wants to return an item.
+    steps:
+      - name: get_order_details
+        task: Get the order details
+        actions:
+          - message: Ask for order number
+          - tool_call: fetch_order
+            result:
+              pass: validate_order_eligibility
+              fail: exit
+
+      - name: validate_order_eligibility
+        task: Validate that the order is eligible for return
+        actions:
+          - tool_call: validate_order_eligibility
+            result:
+              pass: register_return
+              fail: exit
+
+      - name: register_return
+        task: Register the return
+        actions:
+          - message: Give the user an overview of the order
+          - message: Ask which item from the order should be returned
+          - reflect: Validate that the item is eligible for return. Some items are exempt from return, like food.
+            result:
+              fail: exit
+          - message: Ask for confirmation from the user
+            required: true
+            result:
+              fail: intake
+          - tool_call: register_return
+            result:
+              pass: return_item_confirmation
+              fail: exit
+
+      - name: return_item_confirmation
+        task: Confirm the return
+        actions:
+          - message: Provide the user with the return label
+          - message: Ask if they have any other questions

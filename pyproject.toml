@@ -4,10 +4,11 @@ version = "0.1.0"
 description = "Python playground for Google Agent Development Kit experiments."
 requires-python = ">=3.14"
 dependencies = [
-    "google-adk[otel-gcp]==2.0.0",
+    "google-adk[otel-gcp]==2.1.0",
     "langfuse==4.6.1",
     "openinference-instrumentation-google-adk==0.1.14",
     "pydantic==2.12.5",
+    "pyyaml==6.0.3",
 ]
 
 [dependency-groups]
@@ -70,3 +71,4 @@ exclude-newer = "30 days"
 [tool.deptry.package_module_name_map]
 google-adk = "google"
 openinference-instrumentation-google-adk = "openinference"
+pyyaml = "yaml"
