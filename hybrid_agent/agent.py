@@ -205,11 +205,19 @@ def conversation_transcript(ctx: Context) -> list[dict]:
     """Reconstruct the user-visible dialogue from the session events."""
     lines = []
     for event in ctx.session.events:
-        if event.author not in ["user", "hybrid_agent"] or not event.content:
+        # Internal LLM-node inputs are appended as user-authored events with an
+        # isolation scope; skip them so payload JSON doesn't leak into the transcript.
+        internal = event.author not in ["user", "hybrid_agent"] or event.isolation_scope
+        if internal or not event.content:
             continue
         for part in event.content.parts or []:
-            if part.text and part.text.strip():
-                lines.append({"author": event.author, "text": part.text.strip()})
+            text = (part.text or "").strip()
+            if text.startswith("{"):
+                # Internal LLM-node inputs are appended to the session as user-authored
+                # events carrying our JSON payloads; keep them out of the transcript.
+                continue
+            if text:
+                lines.append({"author": event.author, "text": text})
             elif part.function_call and part.function_call.name == "adk_request_input":
                 lines.append(
                     {"author": event.author, "text": (part.function_call.args or {}).get("message")}
@@ -240,7 +248,7 @@ def route_event(target: str, output, facts: dict) -> Event:
     Routing to intake also points current_step there, so follow-up turns
     land in intake instead of re-entering the step that routed away.
     """
-    state = {"facts": facts}
+    state: dict = {"facts": facts}
     if target == "intake":
         state["current_step"] = "intake"
     return Event(output=output, route=target, state=state)
@@ -382,8 +390,19 @@ def make_step_node(step: Step) -> FunctionNode:
 
 
 async def intake(ctx: Context, node_input):
-    """Match the user's request to a flow, or ask what they need."""
+    """Match the user's request to a flow, or ask what they need.
+
+    When reached via a fail route (node_input carries the failure reason),
+    intake must not re-route in the same turn — deterministic re-triage of an
+    unchanged transcript loops forever. It informs the user and ends the turn.
+    """
     transcript = conversation_transcript(ctx)
+    if isinstance(node_input, str) and node_input:
+        utterance = await ctx.run_node(
+            intake_speaker, {"transcript": transcript, "problem": node_input}, run_id="intake:fail"
+        )
+        yield message_event(text_of(utterance))
+        return
     menu = [{"name": flow.name, "description": flow.description} for flow in FLOWS]
     decision = IntakeDecision(
         **await ctx.run_node(

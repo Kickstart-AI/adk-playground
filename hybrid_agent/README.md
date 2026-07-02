@@ -14,7 +14,8 @@ Pydantic schema in `flow_schema.py`, and compiled into an ADK `Workflow` graph i
   - `tool_call`: LLM-extracted arguments, executed against the (stubbed) tools; routes to `result.pass`/`result.fail`.
   - `result.pass` is optional everywhere: if omitted, execution continues with the next action.
 - Per-action `done:` flags make reruns resume at the next pending action instead of re-executing the step.
-- **exit** apologizes with the failure reason and resets state back to intake; unexpected node errors also fall back to intake.
+- **exit** apologizes with the failure reason and fully resets state back to intake; unexpected node errors also fall back to intake.
+- `result.fail: intake` re-triages instead: `current_step` moves to intake but facts and progress flags are kept. Reached via a fail route, intake tells the user the problem and ends the turn (in-turn re-routing would loop); on the next user message it triages normally.
 - All user-facing text is LLM-generated; every LLM call receives the conversation transcript.
 - Langfuse tracing is enabled via OpenInference instrumentation.
 
@@ -26,6 +27,8 @@ Pydantic schema in `flow_schema.py`, and compiled into an ADK `Workflow` graph i
 - Routed edges must be `(node, {route: target})` dicts — the 3-tuple `(node, target, route)` form from the cheatsheet fails Workflow validation in ADK 2.0.0.
 - `RequestInput` interrupts must be answered with a `FunctionResponse` carrying the interrupt id (`adk web`/CLI do this automatically); plain-text replies never resolve them. We dropped interrupts in favor of normal messages plus a dispatcher that routes each turn to `current_step`.
 - Graph validation rejects unreachable nodes, which surfaced a routing bug in the original YAML (`get_order_details` skipping `validate_order_eligibility`).
+- The single-turn LlmAgent wrapper appends each node input to the session as a user-authored event. Rebuilding a transcript from session events therefore picks up internal JSON payloads, which snowball recursively into every later call (author filtering isn't enough — `isolation_scope` isn't always set, so we also drop user events whose text starts with `{`).
+- Routing a failure back to intake for same-turn re-triage loops forever: the transcript is unchanged, so the router deterministically picks the same flow and the same failure recurs (observed 16 cycles in one turn). Fail-routes into a triage node must end the turn and wait for new user input.
 
 ## TODOs
 
