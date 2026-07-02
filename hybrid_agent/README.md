@@ -18,6 +18,15 @@ Pydantic schema in `flow_schema.py`, and compiled into an ADK `Workflow` graph i
 - All user-facing text is LLM-generated; every LLM call receives the conversation transcript.
 - Langfuse tracing is enabled via OpenInference instrumentation.
 
+## Learnings from this session
+
+- LLM agents used as workflow nodes run in `single_turn` mode with `include_contents='none'` — they see no conversation history. Anything they need (transcript, facts) must be passed explicitly in the node input.
+- `ctx.run_node()` on an `LlmAgent` without `output_schema` returns a plain `str`, even though the docs' node-output table says `types.Content`.
+- `Event(state=...)` is consumed at construction into `actions.state_delta`; to amend an already-built event, mutate `event.actions.state_delta`, not `event.state`.
+- Routed edges must be `(node, {route: target})` dicts — the 3-tuple `(node, target, route)` form from the cheatsheet fails Workflow validation in ADK 2.0.0.
+- `RequestInput` interrupts must be answered with a `FunctionResponse` carrying the interrupt id (`adk web`/CLI do this automatically); plain-text replies never resolve them. We dropped interrupts in favor of normal messages plus a dispatcher that routes each turn to `current_step`.
+- Graph validation rejects unreachable nodes, which surfaced a routing bug in the original YAML (`get_order_details` skipping `validate_order_eligibility`).
+
 ## TODOs
 
 - [ ] Add multiple choice possibility to ActionResult
