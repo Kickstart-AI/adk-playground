@@ -35,12 +35,16 @@ speaker = LlmAgent(
     instruction=(
         f"{CONFIG.persona.strip()} "
         "Given an instruction, the conversation transcript, and the known facts, "
-        "write the exact message to send to the user. If answer_options are provided, "
+        "use flow_instructions for scope, tone, and handoff decisions, then write "
+        "the exact message to send to the user. If answer_options are provided, "
         "return exactly one user-facing label for each option, in the same order. "
         "Do not invent route IDs or option values. "
         "Exception: when skip_if_already_answered is set and the conversation already "
         "unambiguously answers the question you were told to ask, do not write a message; "
-        "set answered=true and answer (or selected_index for answer_options) instead. "
+        "set resolved_answer for plain questions or selected_index for answer_options instead. "
+        "If the latest user message clearly cancels the current request or asks for a "
+        "different request outside current_flow, set transfer_to_agent=intake and leave "
+        "message empty. Do not transfer when the latest user message matches current_flow. "
         "Never guess — when in doubt, ask. "
         "Always write in the language the user uses in the transcript."
     ),
@@ -52,7 +56,11 @@ reflector = LlmAgent(
     model=MODEL,
     instruction=(
         "Judge whether the given validation instruction holds based on the known facts. "
-        "Explain your verdict briefly in the reason."
+        "Use flow_instructions for scope and handoff decisions. Explain your verdict "
+        "briefly in the reason. If the latest user message clearly "
+        "cancels the current request or asks for a different request outside current_flow, "
+        "set transfer_to_agent=intake instead of judging. Do not transfer when the latest "
+        "user message matches current_flow."
     ),
     output_schema=Verdict,
 )
@@ -63,7 +71,11 @@ option_selector = LlmAgent(
     instruction=(
         "Given the conversation transcript and the available options, return the zero-based "
         "index of the option the user has clearly chosen. Return -1 when no option has "
-        "clearly been chosen. Never guess."
+        "clearly been chosen. Use flow_instructions for scope and handoff decisions. "
+        "If the latest user message clearly cancels the current "
+        "request or asks for a different request outside current_flow, set "
+        "transfer_to_agent=intake instead of selecting. Do not transfer when the latest "
+        "user message matches current_flow. Never guess."
     ),
     output_schema=OptionSelection,
 )
@@ -72,7 +84,14 @@ extractors = {
     tool_name: LlmAgent(
         name=f"{tool_name}_args",
         model=MODEL,
-        instruction=f"Extract the arguments for tool '{tool_name}' from the conversation facts.",
+        instruction=(
+            f"Extract the arguments for tool '{tool_name}' from the conversation facts. "
+            "Use flow_instructions for scope and handoff decisions. "
+            "If the latest user message clearly cancels the current request or asks for a "
+            "different request outside current_flow, set transfer_to_agent=intake instead "
+            "of extracting arguments. Do not transfer when the latest user message matches "
+            "current_flow."
+        ),
         output_schema=args_model,
     )
     for tool_name, (_, args_model) in TOOLS.items()
@@ -165,6 +184,13 @@ async def run_speaker(ctx: Context, payload: dict, run_id: str) -> SpeakerRespon
     return speaker_response_of(await ctx.run_node(speaker, payload, run_id=run_id))
 
 
+def handoff_event(response):
+    """Route to intake when structured output returns a transfer target."""
+    if response.transfer_to_agent == "intake":
+        return Event(output=None, route="intake", state=INTAKE_RESET)
+    return None
+
+
 def labels_for_options(response: SpeakerResponse, options: list[AnswerOption]) -> list[str]:
     """Return one user-facing label for each YAML option."""
     labels = [option.label for option in response.answer_options]
@@ -200,6 +226,8 @@ async def select_answer_option(run_id: str, ctx: Context, memo: dict, options: l
             run_id=f"{run_id}:select",
         )
     )
+    if event := handoff_event(selection):
+        return event
     if 0 <= selection.selected_index < len(options):
         return options[selection.selected_index]
     return None
@@ -221,6 +249,8 @@ async def ask_message_action(step_name: str, run_id: str, action: Action, ctx: C
         resolved, event = resolved_event(action, response, memo)
         if resolved:
             return event
+    if event := handoff_event(response):
+        return event
     labels = labels_for_options(response, action.answer_options)
     options = runtime_options(action.answer_options, labels)
     return message_event(
@@ -245,8 +275,8 @@ def resolved_event(action: Action, response: SpeakerResponse, memo: dict):
         if 0 <= response.selected_index < len(options):
             return True, apply_selected_option(action, options[response.selected_index], memo)
         return False, None
-    if response.answered:
-        memo["facts"][action.message] = response.answer
+    if response.resolved_answer:
+        memo["facts"][action.message] = response.resolved_answer
         return True, answered_event(action, memo)
     return False, None
 
@@ -266,6 +296,8 @@ async def ask_to_choose_option(
         },
         run_id=f"{run_id}:retry_options",
     )
+    if event := handoff_event(response):
+        return event
     return message_event(
         response.message,
         state={"current_step": step_name},
@@ -287,6 +319,8 @@ async def handle_answer_option_reply(
     """Process a user's reply to a message with answer options."""
     options = ctx.state.get(f"options:{run_id}", [])
     selected = await select_answer_option(run_id, ctx, memo, options)
+    if isinstance(selected, Event):
+        return selected
     if not selected:
         return await ask_to_choose_option(step_name, run_id, ctx, memo, options)
     return apply_selected_option(action, selected, memo)
@@ -312,6 +346,8 @@ async def handle_asked_message(
             run_id=f"{run_id}:verify",
         )
     )
+    if event := handoff_event(verdict):
+        return event
     if verdict.passed:
         return answered_event(action, memo)
     return route_event(action.result.fail, verdict.reason, memo["facts"])
@@ -329,6 +365,36 @@ async def run_message_action(step_name: str, run_id: str, action: Action, ctx: C
     return await ask_message_action(step_name, run_id, action, ctx, memo)
 
 
+async def run_reflect_action(run_id: str, action: Action, ctx: Context, memo: dict):
+    """Run a reflect action, including same-call handoff detection."""
+    assert action.result is not None and action.result.fail is not None
+    facts = memo["facts"]
+    verdict = Verdict(
+        **await ctx.run_node(reflector, {"instruction": action.reflect, **memo}, run_id=run_id)
+    )
+    if event := handoff_event(verdict):
+        return event
+    if not verdict.passed:
+        return route_event(action.result.fail, verdict.reason, facts)
+    return None
+
+
+async def run_tool_action(run_id: str, action: Action, ctx: Context, memo: dict):
+    """Run a tool action, including same-call handoff detection."""
+    assert action.tool_call is not None
+    assert action.result is not None and action.result.fail is not None
+    facts = memo["facts"]
+    tool, args_model = TOOLS[action.tool_call]
+    args = args_model(**await ctx.run_node(extractors[action.tool_call], memo, run_id=run_id))
+    if event := handoff_event(args):
+        return event
+    try:
+        facts[f"{action.tool_call}_result"] = tool(**args.model_dump(exclude={"transfer_to_agent"}))
+    except ValueError as error:
+        return route_event(action.result.fail, str(error), facts)
+    return None
+
+
 async def run_action(step: Step, index: int, action: Action, ctx: Context, memo: dict):
     """Run one action; return an Event that ends the step, or None to continue.
 
@@ -337,26 +403,18 @@ async def run_action(step: Step, index: int, action: Action, ctx: Context, memo:
     run_id = f"{step.name}:{index}"
     if action.message is not None:
         return await run_message_action(step.name, run_id, action, ctx, memo)
-    facts = memo["facts"]
     # Guaranteed by flow_schema route validation.
     assert action.result is not None and action.result.fail is not None
     if action.reflect is not None:
-        verdict = Verdict(
-            **await ctx.run_node(reflector, {"instruction": action.reflect, **memo}, run_id=run_id)
-        )
-        if not verdict.passed:
-            return route_event(action.result.fail, verdict.reason, facts)
+        event = await run_reflect_action(run_id, action, ctx, memo)
     else:
         assert action.tool_call is not None  # only action kind left after message and reflect
-        tool, args_model = TOOLS[action.tool_call]
-        args = args_model(**await ctx.run_node(extractors[action.tool_call], memo, run_id=run_id))
-        try:
-            facts[f"{action.tool_call}_result"] = tool(**args.model_dump())
-        except ValueError as error:
-            return route_event(action.result.fail, str(error), facts)
+        event = await run_tool_action(run_id, action, ctx, memo)
+    if event:
+        return event
     # Success: route onward if a pass target is set, otherwise continue with the next action.
     if action.result.passed:
-        return route_event(action.result.passed, facts, facts)
+        return route_event(action.result.passed, memo["facts"], memo["facts"])
     return None
 
 
@@ -377,6 +435,8 @@ async def execute_step(step: Step, ctx: Context) -> Event:
     memo = {
         "transcript": conversation_transcript(ctx),
         "facts": facts,
+        "current_flow": flow.name,
+        "current_flow_description": flow.description,
         "flow_instructions": flow.instructions,
         "step_task": step.task,
     }
@@ -401,6 +461,8 @@ async def execute_step(step: Step, ctx: Context) -> Event:
         raise ValueError(f"Step {step.name} finished without routing anywhere.")
     instruction = " Then: ".join(a.message for a in step.actions if a.message is not None)
     response = await run_speaker(ctx, {"instruction": instruction, **memo}, f"{step.name}:close")
+    if event := handoff_event(response):
+        return event
     return message_event(response.message, output=response.message, state=INTAKE_RESET)
 
 
@@ -421,6 +483,8 @@ async def report_step_failure(step: Step, ctx: Context, reason: str) -> Event:
         },
         run_id=f"{step.name}:fail",
     )
+    if event := handoff_event(response):
+        return event
     return message_event(response.message, state={**step_reset(step), "current_step": step.name})
 
 
@@ -505,6 +569,9 @@ async def exit_flow(ctx: Context, node_input):
         },
         run_id="exit:close",
     )
+    if event := handoff_event(response):
+        yield event
+        return
     yield message_event(response.message, output=response.message, state=INTAKE_RESET)
 
 
@@ -545,8 +612,10 @@ def build_workflow() -> Workflow:
             ]
             if target
         }
+        targets.add("intake")
         if targets:
             edges.append((nodes[step.name], {target: nodes[target] for target in targets}))
+    edges.append((nodes["exit"], {"intake": intake_node}))
 
     return Workflow(
         name="hybrid_agent",

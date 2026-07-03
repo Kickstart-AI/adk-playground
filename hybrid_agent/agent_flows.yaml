@@ -6,7 +6,11 @@ instruction: >
 flows:
   - name: return_item
     description: The user wants to return an item.
-    instructions: "TODO: Add flow specific instructions here."
+    instructions: >
+      Help the user return an item from an existing order. Stay in this flow for
+      order-number lookup, return eligibility, item selection, refund preference,
+      confirmation, and return-label questions. Hand off when the user cancels the
+      return or asks for unrelated account changes, shopping help, or another request.
     steps:
       - name: get_order_details
         task: Get the order details
@@ -56,7 +60,12 @@ flows:
 
   - name: change_account
     description: The user wants to change their account details.
-    instructions: "TODO: Add flow specific instructions here."
+    instructions: >
+      Help the user change account details after email and login-number verification.
+      Stay in this flow for account lookup, login-code validation, payment-method
+      changes, address changes, and confirmation questions. Hand off when the user
+      cancels the account change or asks for returns, order issues, shopping help,
+      or another unrelated request.
     steps:
       - name: get_user_details
         task: Get the user account details

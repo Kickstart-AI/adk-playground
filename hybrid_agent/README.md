@@ -4,6 +4,17 @@ A customer-service agent that combines a deterministic flow graph with LLM-drive
 The flows (steps, tool calls, routing) are declared in `agent_flows.yaml`, validated by the
 Pydantic schema in `flow_schema.py`, and compiled into an ADK `Workflow` graph in `agent.py`.
 
+## Motivation
+We want to combine the flexibility of GenAI with the predictability of a rule-based bot, in particular:
+
+- Have guarantees that required flow actions run in YAML order, unless an optional question is already answered by the transcript.
+- Natural conversation.
+- Have the answers tailored to the user (no hardcoded answers, language flexibility).
+- Have guarantees that the bot will ask or say a required message (like a disclaimer, asking for confirmation, ...).
+- Have the ability to infer intent and context from the conversation history rather than explicitly asking for every bit of information.
+- Change tone of voice or instructions based on the situation rather than one general system prompt.
+- Be able to exit a flow when the user changes intent or is in the wrong flow.
+
 ## How it works
 
 - **dispatch** routes each turn to the current step (`current_step` in session state), defaulting to **intake**.
@@ -34,7 +45,7 @@ Pydantic schema in `flow_schema.py`, and compiled into an ADK `Workflow` graph i
 ## TODOs
 
 - [x] Add multiple choice possibility (`answer_options` on message actions)
-- [ ] Each node should have the option to hand off to the intake agent if the user changes their mind or they are in the wrong step or flow or something
+- [x] Each node should have the option to hand off to the intake agent if the user changes their mind or they are in the wrong step or flow or something
 - [x] Simplify where possible and sensible the number of LLM calls (intake router+speaker merged; ask-path resolver folded into the speaker call)
-- [ ] Exercise the `change_account` flow end-to-end (login-number loop, both answer-option kinds)
+- [x] Exercise the `change_account` flow end-to-end (login-number loop, both answer-option kinds)
 - [ ] Decide whether `result.fail: intake` should keep facts for a later flow re-entry (currently full reset, same as exit)

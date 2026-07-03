@@ -1,48 +1,59 @@
 """Tool implementations and argument schemas for the hybrid agent."""
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
-class FetchOrderArgs(BaseModel):
+class ToolArgs(BaseModel):
+    """Common structured output for tool argument extraction."""
+
+    transfer_to_agent: str = Field(
+        "",
+        description=(
+            "Workflow target to route to instead of extracting arguments, currently intake."
+        ),
+    )
+
+
+class FetchOrderArgs(ToolArgs):
     """Arguments for fetch_order."""
 
     order_number: str
 
 
-class ValidateArgs(BaseModel):
+class ValidateArgs(ToolArgs):
     """Arguments for validate_order_eligibility."""
 
     order_number: str
 
 
-class RegisterReturnArgs(BaseModel):
+class RegisterReturnArgs(ToolArgs):
     """Arguments for register_return."""
 
     order_number: str
     item: str
 
 
-class SendLoginNumberArgs(BaseModel):
+class SendLoginNumberArgs(ToolArgs):
     """Arguments for send_login_number."""
 
     email: str
 
 
-class ValidateLoginNumberArgs(BaseModel):
+class ValidateLoginNumberArgs(ToolArgs):
     """Arguments for validate_login_number."""
 
     email: str
     login_number: str
 
 
-class ChangePaymentMethodArgs(BaseModel):
+class ChangePaymentMethodArgs(ToolArgs):
     """Arguments for change_payment_method."""
 
     email: str
     payment_method: str
 
 
-class ChangeAddressArgs(BaseModel):
+class ChangeAddressArgs(ToolArgs):
     """Arguments for change_address."""
 
     email: str
