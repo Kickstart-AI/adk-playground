@@ -15,7 +15,8 @@ Pydantic schema in `flow_schema.py`, and compiled into an ADK `Workflow` graph i
   - `result.pass` is optional everywhere: if omitted, execution continues with the next action.
 - Per-action `done:` flags make reruns resume at the next pending action instead of re-executing the step.
 - **exit** apologizes with the failure reason and fully resets state back to intake; unexpected node errors also fall back to intake.
-- `result.fail: intake` re-triages instead: `current_step` moves to intake but facts and progress flags are kept. Reached via a fail route, intake tells the user the problem and ends the turn (in-turn re-routing would loop); on the next user message it triages normally.
+- `result.fail: intake` abandons the flow: intake tells the user the problem, fully resets state (like exit), and triages the next user message normally. A fail route targeting a step likewise ends the turn — the speaker explains the problem and the step's flags are reset so it re-runs from the top next turn (in-turn re-execution of an unchanged transcript would loop).
+- `message` actions can carry `answer_options` with a deterministic `route` or `value` per option; labels are LLM-phrased, selection is matched by an LLM against the transcript (also pre-ask, to skip already-answered choices).
 - All user-facing text is LLM-generated; every LLM call receives the conversation transcript.
 - Langfuse tracing is enabled via OpenInference instrumentation.
 
@@ -32,6 +33,8 @@ Pydantic schema in `flow_schema.py`, and compiled into an ADK `Workflow` graph i
 
 ## TODOs
 
-- [ ] Add multiple choice possibility to ActionResult
+- [x] Add multiple choice possibility (`answer_options` on message actions)
 - [ ] Each node should have the option to hand off to the intake agent if the user changes their mind or they are in the wrong step or flow or something
 - [ ] Simplify where possible and sensible the number of LLM calls, for example intake router and intake speaker could be one call etc.
+- [ ] Exercise the `change_account` flow end-to-end (login-number loop, both answer-option kinds)
+- [ ] Decide whether `result.fail: intake` should keep facts for a later flow re-entry (currently full reset, same as exit)

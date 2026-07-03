@@ -6,6 +6,7 @@ instruction: >
 flows:
   - name: return_item
     description: The user wants to return an item.
+    instructions: "TODO: Add flow specific instructions here."
     steps:
       - name: get_order_details
         task: Get the order details
@@ -46,3 +47,60 @@ flows:
         actions:
           - message: Provide the user with the return label
           - message: Ask if they have any other questions
+
+  - name: change_account
+    description: The user wants to change their account details.
+    instructions: "TODO: Add flow specific instructions here."
+    steps:
+      - name: get_user_details
+        task: Get the user account details
+        actions:
+          - message: Ask for the user's email address
+          - tool_call: send_login_number
+            result:
+              fail: get_user_details
+          - message: Ask the user to provide the login number received by email
+          - tool_call: validate_login_number
+            result:
+              pass: determine_change
+              fail: get_user_details
+      - name: determine_change
+        task: Determine what the user wants to change
+        actions:
+          - message: Give the user an overview of their account and ask what the user wants to change
+            answer_options:
+              - name: Payment Method
+                route: change_payment_method
+              - name: Address
+                route: change_address
+      - name: change_payment_method
+        task: Change the user's payment method
+        actions:
+          - message: Ask what payment method they would like to change to
+            answer_options:
+              - name: Credit Card
+                value: credit_card
+              - name: PayPal
+                value: paypal
+              - name: Bank Transfer
+                value: bank_transfer
+          - tool_call: change_payment_method
+            result:
+              pass: change_payment_method_confirmation
+              fail: exit
+      - name: change_payment_method_confirmation
+        task: Confirm the payment method change
+        actions:
+          - message: Confirm that the change is successful
+      - name: change_address
+        task: Change the user's address
+        actions:
+          - message: Ask the user to provide the new address
+          - tool_call: change_address
+            result:
+              pass: change_address_confirmation
+              fail: exit
+      - name: change_address_confirmation
+        task: Confirm the address change
+        actions:
+          - message: Confirm that the change is successful
