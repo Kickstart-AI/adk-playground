@@ -10,10 +10,18 @@ class SpeakerOption(BaseModel):
 
 
 class SpeakerResponse(BaseModel):
-    """User-facing speaker text and localized option labels."""
+    """User-facing speaker text, or a resolution when the transcript already answers.
 
-    message: str
+    When skipping is allowed and the conversation already clearly answers the
+    question, the speaker sets answered/answer (plain questions) or
+    selected_index (multiple choice) instead of writing a message.
+    """
+
+    message: str = ""
     answer_options: list[SpeakerOption] = Field(default_factory=list)
+    answered: bool = False
+    answer: str = ""
+    selected_index: int = -1
 
 
 class OptionSelection(BaseModel):
@@ -23,18 +31,11 @@ class OptionSelection(BaseModel):
     reason: str
 
 
-class IntakeDecision(BaseModel):
-    """Which flow matches the user's request."""
+class IntakeResponse(BaseModel):
+    """Triage result: a matching flow name, or the message to send instead."""
 
     flow: str = ""  # empty if no clear match yet
-
-
-class Resolution(BaseModel):
-    """Whether the conversation already answers a question we were about to ask."""
-
-    answered: bool
-    answer: str = ""
-    reason: str
+    message: str = ""
 
 
 class Verdict(BaseModel):

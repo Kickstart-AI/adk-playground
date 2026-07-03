@@ -7,9 +7,9 @@ Pydantic schema in `flow_schema.py`, and compiled into an ADK `Workflow` graph i
 ## How it works
 
 - **dispatch** routes each turn to the current step (`current_step` in session state), defaulting to **intake**.
-- **intake** matches the user's request against the flow descriptions and routes into the matching flow, or converses naturally.
+- **intake** is a single LLM call that either routes into the matching flow or returns the conversational reply to send.
 - Each YAML step becomes a workflow node. Actions:
-  - `message`: phrased by the LLM speaker and sent as a normal reply ending the turn; the answer is read from the transcript next turn. Skipped when the resolver finds the answer already in the conversation, unless marked `required: true`. Optional `result.fail` routes away when the reply is judged negative.
+  - `message`: phrased by the LLM speaker and sent as a normal reply ending the turn; the answer is read from the transcript next turn. The same speaker call may instead resolve the question from the conversation (skipping the ask), unless marked `required: true`. Optional `result.fail` routes away when the reply is judged negative.
   - `reflect`: an LLM verdict on a validation instruction; `result.fail` routes away on failure.
   - `tool_call`: LLM-extracted arguments, executed against the (stubbed) tools; routes to `result.pass`/`result.fail`.
   - `result.pass` is optional everywhere: if omitted, execution continues with the next action.
@@ -35,6 +35,6 @@ Pydantic schema in `flow_schema.py`, and compiled into an ADK `Workflow` graph i
 
 - [x] Add multiple choice possibility (`answer_options` on message actions)
 - [ ] Each node should have the option to hand off to the intake agent if the user changes their mind or they are in the wrong step or flow or something
-- [ ] Simplify where possible and sensible the number of LLM calls, for example intake router and intake speaker could be one call etc.
+- [x] Simplify where possible and sensible the number of LLM calls (intake router+speaker merged; ask-path resolver folded into the speaker call)
 - [ ] Exercise the `change_account` flow end-to-end (login-number loop, both answer-option kinds)
 - [ ] Decide whether `result.fail: intake` should keep facts for a later flow re-entry (currently full reset, same as exit)

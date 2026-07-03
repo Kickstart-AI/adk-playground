@@ -33,6 +33,12 @@ flows:
           - reflect: Validate that the item is eligible for return. Some items are exempt from return, like food.
             result:
               fail: exit
+          - message: Ask how the user want to receive the refund
+            answer_options:
+              - name: Refund on payment method
+                value: refund_on_payment_method
+              - name: Voucher
+                value: voucher
           - message: Ask for confirmation from the user
             required: true
             result:

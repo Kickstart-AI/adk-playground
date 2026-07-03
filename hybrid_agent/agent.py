@@ -13,9 +13,8 @@ from openinference.instrumentation.google_adk import GoogleADKInstrumentor
 from .events import answered_event, message_event, route_event
 from .flow_schema import Action, AnswerOption, Step, load_config
 from .response_schemas import (
-    IntakeDecision,
+    IntakeResponse,
     OptionSelection,
-    Resolution,
     SpeakerResponse,
     Verdict,
 )
@@ -38,20 +37,14 @@ speaker = LlmAgent(
         "Given an instruction, the conversation transcript, and the known facts, "
         "write the exact message to send to the user. If answer_options are provided, "
         "return exactly one user-facing label for each option, in the same order. "
-        "Do not invent route IDs or option values."
+        "Do not invent route IDs or option values. "
+        "Exception: when skip_if_already_answered is set and the conversation already "
+        "unambiguously answers the question you were told to ask, do not write a message; "
+        "set answered=true and answer (or selected_index for answer_options) instead. "
+        "Never guess — when in doubt, ask. "
+        "Always write in the language the user uses in the transcript."
     ),
     output_schema=SpeakerResponse,
-)
-
-resolver = LlmAgent(
-    name="resolver",
-    model=MODEL,
-    instruction=(
-        "You are given a question the agent is about to ask the user, plus the conversation "
-        "transcript and known facts. Decide whether the answer is already clearly provided. "
-        "Only set answered=true if the user unambiguously gave the answer; never guess."
-    ),
-    output_schema=Resolution,
 )
 
 reflector = LlmAgent(
@@ -86,29 +79,24 @@ extractors = {
 }
 
 
-intake_speaker = LlmAgent(
-    name="intake_speaker",
-    model=MODEL,
-    instruction=f"{CONFIG.persona.strip()} {CONFIG.instruction.strip()}",
-)
-
-intake_router = LlmAgent(
-    name="intake_router",
+intake_agent = LlmAgent(
+    name="intake_agent",
     model=MODEL,
     instruction=(
-        "Decide which of the available flows matches the user's request based on the "
-        "conversation transcript. Return the flow name, or an empty string if no flow "
-        "clearly matches yet."
+        f"{CONFIG.persona.strip()} {CONFIG.instruction.strip()} "
+        "When available flows are provided and the user's request clearly matches one, "
+        "return its name in flow and leave message empty. Otherwise leave flow empty "
+        "and write the message to send to the user. When a problem is provided, explain "
+        "it, ask how else you can help, and leave flow empty. "
+        "Always write in the language the user uses in the transcript."
     ),
-    output_schema=IntakeDecision,
+    output_schema=IntakeResponse,
 )
 
 INTERNAL_AGENTS = {
     "speaker",
     "reflector",
-    "resolver",
-    "intake_router",
-    "intake_speaker",
+    "intake_agent",
     "option_selector",
     *extractors,
 }
@@ -165,11 +153,6 @@ def conversation_transcript(ctx: Context) -> list[dict]:
     return lines
 
 
-def text_of(output: str) -> str:
-    """Extract the plain text from an LLM agent's output."""
-    return output.strip()
-
-
 def speaker_response_of(output: dict) -> SpeakerResponse:
     """Parse structured speaker output from an LLM node."""
     return SpeakerResponse(**output)
@@ -223,16 +206,21 @@ async def select_answer_option(run_id: str, ctx: Context, memo: dict, options: l
 
 
 async def ask_message_action(step_name: str, run_id: str, action: Action, ctx: Context, memo: dict):
-    """Generate and send a message action to the user."""
+    """One speaker call: resolve the question from the transcript if allowed, else ask it."""
     response = await run_speaker(
         ctx,
         {
             "instruction": action.message,
             "answer_options": [{"name": option.name} for option in action.answer_options],
+            **({"skip_if_already_answered": True} if not action.required else {}),
             **memo,
         },
         run_id=f"{run_id}:speak",
     )
+    if not action.required:
+        resolved, event = resolved_event(action, response, memo)
+        if resolved:
+            return event
     labels = labels_for_options(response, action.answer_options)
     options = runtime_options(action.answer_options, labels)
     return message_event(
@@ -244,6 +232,23 @@ async def ask_message_action(step_name: str, run_id: str, action: Action, ctx: C
         },
         answer_options=options,
     )
+
+
+def resolved_event(action: Action, response: SpeakerResponse, memo: dict):
+    """Apply the speaker's in-transcript resolution.
+
+    Returns (resolved, event); the event may be None, meaning continue with
+    the next action.
+    """
+    if action.answer_options:
+        options = runtime_options(action.answer_options, [o.name for o in action.answer_options])
+        if 0 <= response.selected_index < len(options):
+            return True, apply_selected_option(action, options[response.selected_index], memo)
+        return False, None
+    if response.answered:
+        memo["facts"][action.message] = response.answer
+        return True, answered_event(action, memo)
+    return False, None
 
 
 async def ask_to_choose_option(
@@ -312,45 +317,15 @@ async def handle_asked_message(
     return route_event(action.result.fail, verdict.reason, memo["facts"])
 
 
-async def resolve_existing_answer(action: Action, run_id: str, ctx: Context, memo: dict):
-    """Resolve an optional question from existing transcript context."""
-    resolution = Resolution(
-        **await ctx.run_node(
-            resolver, {"question": action.message, **memo}, run_id=f"{run_id}:resolve"
-        )
-    )
-    if not resolution.answered:
-        return False, None
-    memo["facts"][action.message] = resolution.answer
-    return True, answered_event(action, memo)
-
-
-async def resolve_existing_option(action: Action, run_id: str, ctx: Context, memo: dict):
-    """Resolve an optional multiple-choice question from existing transcript context."""
-    options = runtime_options(action.answer_options, [o.name for o in action.answer_options])
-    selected = await select_answer_option(run_id, ctx, memo, options)
-    if selected is None:
-        return False, None
-    return True, apply_selected_option(action, selected, memo)
-
-
 async def run_message_action(step_name: str, run_id: str, action: Action, ctx: Context, memo: dict):
     """Ask the user a message action's question, unless already asked or answerable.
 
     Asks as a normal message ending the turn; the answer arrives in the next
     turn's transcript and the dispatcher routes back to this step. Non-required
-    questions are skipped when the resolver finds the answer in the conversation.
+    questions are skipped when the speaker finds the answer in the conversation.
     """
-
     if ctx.state.get(f"asked:{run_id}"):
         return await handle_asked_message(step_name, run_id, action, ctx, memo)
-
-    if not action.required:
-        resolve = resolve_existing_option if action.answer_options else resolve_existing_answer
-        resolved, event = await resolve(action, run_id, ctx, memo)
-        if resolved:
-            return event
-
     return await ask_message_action(step_name, run_id, action, ctx, memo)
 
 
@@ -461,12 +436,14 @@ def make_step_node(step: Step) -> FunctionNode:
         except Exception:
             # Fallback: hand the conversation back to intake instead of dying.
             logger.error("Step %s failed, falling back to intake.", step.name, exc_info=True)
-            utterance = await ctx.run_node(
-                intake_speaker,
-                {"transcript": conversation_transcript(ctx)},
-                run_id=f"{step.name}:fallback",
+            response = IntakeResponse(
+                **await ctx.run_node(
+                    intake_agent,
+                    {"transcript": conversation_transcript(ctx)},
+                    run_id=f"{step.name}:fallback",
+                )
             )
-            return message_event(text_of(utterance), state=INTAKE_RESET)
+            return message_event(response.message, state=INTAKE_RESET)
 
     return FunctionNode(func=run_step, name=step.name, rerun_on_resume=True)
 
@@ -480,12 +457,18 @@ async def intake(ctx: Context, node_input):
     """
     transcript = conversation_transcript(ctx)
     if isinstance(node_input, str) and node_input:
-        utterance = await ctx.run_node(
-            intake_speaker, {"transcript": transcript, "problem": node_input}, run_id="intake:fail"
+        # No flows in the payload: entered via a fail route, intake must not
+        # re-route in the same turn. It explains the problem and ends the turn.
+        response = IntakeResponse(
+            **await ctx.run_node(
+                intake_agent,
+                {"transcript": transcript, "problem": node_input},
+                run_id="intake:fail",
+            )
         )
         # Consistent with report_step_failure: the abandoned flow's flags must not
         # linger, or re-entering it later would skip its done actions.
-        yield message_event(text_of(utterance), state=INTAKE_RESET)
+        yield message_event(response.message, state=INTAKE_RESET)
         return
     menu = [
         {
@@ -495,18 +478,17 @@ async def intake(ctx: Context, node_input):
         }
         for flow in FLOWS
     ]
-    decision = IntakeDecision(
+    response = IntakeResponse(
         **await ctx.run_node(
-            intake_router, {"flows": menu, "transcript": transcript}, run_id="intake:route"
+            intake_agent, {"flows": menu, "transcript": transcript}, run_id="intake:triage"
         )
     )
     first_steps = {flow.name: flow.steps[0].name for flow in FLOWS}
-    if decision.flow in first_steps:
+    if response.flow in first_steps:
         # output=None: a string output would be mistaken for a fail-route reason.
-        yield Event(output=None, route=first_steps[decision.flow])
+        yield Event(output=None, route=first_steps[response.flow])
         return
-    utterance = await ctx.run_node(intake_speaker, {"transcript": transcript}, run_id="intake:ask")
-    yield message_event(text_of(utterance))
+    yield message_event(response.message)
 
 
 async def exit_flow(ctx: Context, node_input):
