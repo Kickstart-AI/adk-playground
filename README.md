@@ -2,6 +2,16 @@
 
 A small repo for trying Google ADK Python agents.
 
+## Table of contents
+
+- [Install](#install)
+- [Directory tree](#directory-tree)
+- [Agents](#agents)
+- [Create an agent](#create-an-agent)
+- [Authenticate with an API key](#authenticate-with-an-api-key)
+- [Set up Langfuse](#set-up-langfuse)
+- [Start an agent](#start-an-agent)
+
 ## Install
 
 Install the project dependencies:
@@ -11,6 +21,23 @@ uv sync
 ```
 
 Python `>=3.14` is required.
+
+## Directory tree
+
+```text
+.
+├── deep_research_agent/   # Dynamic ADK workflow for research tasks
+├── hybrid_agent/          # Flow-driven customer-service agent
+├── recursive_agent/       # Recursive agent experiment
+├── .agents/               # Local agent skills and supporting metadata
+├── .adk/                  # Local ADK runtime state and artifacts
+├── mlartifacts/           # Local MLflow/Langfuse-related artifacts
+├── .env.example           # Example environment variables for agents
+├── docker-compose.yaml    # Local Langfuse stack
+├── pyproject.toml         # Python project configuration
+├── uv.lock                # Locked Python dependencies
+└── README.md              # Project overview
+```
 
 ## Agents
 
@@ -22,6 +49,25 @@ It is built for research tasks. The planner checks whether the request is clear
 enough to run. If not, it asks clarifying questions. If the request is clear, the
 planner breaks it into independent subtasks, the workflow runs one researcher per
 subtask in parallel, and the writer turns the findings into a cited report.
+
+### `hybrid_agent`
+
+`hybrid_agent` is a customer-service agent that combines a deterministic YAML
+flow graph with LLM-generated conversation.
+
+It supports online-shop tasks such as returns and account changes. The YAML file
+defines steps, tool calls, routing, and answer options; the LLM nodes phrase
+messages, infer already-provided answers from the transcript, and hand back to
+intake when the user changes intent.
+
+### `recursive_agent`
+
+`recursive_agent` is an experiment in recursive agent self-improvement.
+
+Each turn starts with a general agent that either answers directly or proposes a
+replacement agent schema. The workflow can rebuild the active agent with new
+instructions, tools, code execution, or specialist sub-agents, then retries up to
+a recursion limit before returning a final answer.
 
 ## Create an agent
 
