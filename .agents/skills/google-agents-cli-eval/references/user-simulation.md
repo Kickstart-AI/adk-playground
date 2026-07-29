@@ -15,7 +15,7 @@ A user scenario is a `starting_prompt` (the user's opening message) plus a free-
 ## Running `eval dataset synthesize`
 
 ```bash
-# Synthesize 3 scenarios (default), simulate them, write traces to artifacts/traces/dataset_<ts>.json
+# Synthesize 3 scenarios (default), simulate them, write traces to artifacts/traces/traces_<ts>.json
 agents-cli eval dataset synthesize
 
 # Steer scenario generation with an instruction and environment context
@@ -38,7 +38,7 @@ CLI flags exposed by `agents-cli eval dataset synthesize`:
 | `--environment-context` | World context the simulator can rely on (e.g., available data) |
 | `--model` | Model used for **scenario generation** (server-side; not the simulated user model) |
 | `--max-turns` | Cap on user↔agent turns per scenario (default 5) |
-| `-o / --output` | Output path; defaults to `artifacts/traces/dataset_<ts>.json` |
+| `-o / --output` | Output path; defaults to `artifacts/traces/traces_<ts>.json` |
 | `--project` / `--region` | GCP project / region overrides. `synthesize` defaults to the `global` eval endpoint (ignores the manifest `region`); pass `--region` only for data residency — the service rejects an unsupported one. |
 
 **Simulator internals are NOT user-configurable from agents-cli.** The LLM-backed user simulator that plays the user side runs inside `_synthesize_runner.py` with hardcoded ADK defaults (`gemini-2.5-flash` for the user voice, default thinking config, no `custom_instructions`). Only `--max-turns` reaches it (as `LlmBackedUserSimulatorConfig.max_allowed_invocations`). There is no `eval_config.yaml` key, no `--simulator-model` flag, and no way to override `custom_instructions` or `model_configuration` short of editing `_synthesize_runner.py` directly.

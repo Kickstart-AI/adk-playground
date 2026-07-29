@@ -20,7 +20,7 @@ Install the project dependencies:
 uv sync
 ```
 
-Python `>=3.14` is required.
+Python `>=3.13,<3.14` is required.
 
 ## Directory tree
 

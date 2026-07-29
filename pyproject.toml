@@ -2,10 +2,11 @@
 name = "adk-playground"
 version = "0.1.0"
 description = "Python playground for Google Agent Development Kit experiments."
-requires-python = ">=3.14"
+requires-python = ">=3.13,<3.14"
 dependencies = [
-    "google-adk[otel-gcp]==2.1.0",
+    "google-adk[otel-gcp]==2.2.0",
     "langfuse==4.6.1",
+    "litellm==1.89.4",
     "openinference-instrumentation-google-adk==0.1.14",
     "pydantic==2.12.5",
     "pyyaml==6.0.3",
@@ -21,7 +22,7 @@ dev = [
 
 [tool.ruff]
 line-length = 100
-target-version = "py314"
+target-version = "py313"
 src = ["deep_research_agent", "recursive_agent"]
 extend-exclude = [".venv", "venv", "build", "dist", ".ruff_cache", ".pytest_cache"]
 
@@ -65,6 +66,12 @@ exclude = [".venv", "venv", "build", "dist", ".ruff_cache", ".pytest_cache"]
 [tool.ty.analysis]
 respect-type-ignore-comments = true
 
+[[tool.ty.overrides]]
+include = ["hybrid_agent/**"]
+
+[tool.ty.overrides.rules]
+unknown-argument = "ignore"
+
 [tool.uv]
 exclude-newer = "30 days"
 
@@ -72,3 +79,6 @@ exclude-newer = "30 days"
 google-adk = "google"
 openinference-instrumentation-google-adk = "openinference"
 pyyaml = "yaml"
+
+[tool.deptry.per_rule_ignores]
+DEP002 = ["litellm"]
