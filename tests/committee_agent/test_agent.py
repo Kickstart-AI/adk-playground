@@ -58,7 +58,8 @@ def test_ranking_payloads_contain_no_model_ids() -> None:
         async def run_node(self, _agent, payload, run_id):
             payloads.append((run_id, payload))
             return {
-                "candidate_ids": [candidate["candidate_id"] for candidate in payload["candidates"]]
+                "candidate_ids": [candidate["candidate_id"] for candidate in payload["candidates"]],
+                "reasoning": "Test ranking.",
             }
 
     ballots = asyncio.run(

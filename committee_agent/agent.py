@@ -37,6 +37,7 @@ class Ranking(BaseModel):
     candidate_ids: list[str] = Field(
         description="Every candidate ID exactly once, ordered from best to worst."
     )
+    reasoning: str = Field(description="The reasoning behind the ranking.")
 
 
 @dataclass(frozen=True)
@@ -52,10 +53,11 @@ class Member:
 def create_member(index: int, model_id: str) -> Member:
     """Create generic agents for one privately identified model."""
     model = LiteLlm(model=model_id)
+    model_id = model_id.replace("/", "_").replace("-", "_").replace(".", "_")
     return Member(
         model_id=model_id,
         answerer=LlmAgent(
-            name=f"member_{index}_answerer",
+            name=f"member_{model_id}_answerer",
             model=model,
             include_contents="none",
             instruction=(
@@ -66,7 +68,7 @@ def create_member(index: int, model_id: str) -> Member:
             output_schema=Answer,
         ),
         ranker=LlmAgent(
-            name=f"member_{index}_ranker",
+            name=f"member_{model_id}_ranker",
             model=model,
             include_contents="none",
             instruction=(
@@ -78,7 +80,7 @@ def create_member(index: int, model_id: str) -> Member:
             output_schema=Ranking,
         ),
         synthesizer=LlmAgent(
-            name=f"member_{index}_synthesizer",
+            name=f"member_{model_id}_synthesizer",
             model=model,
             include_contents="none",
             instruction=(
@@ -100,14 +102,18 @@ def visible_conversation(ctx: Context) -> list[dict[str, str]]:
     """Extract only user-visible text and hide internal agent identities."""
     conversation = []
     for event in ctx.session.events:
-        if event.isolation_scope or not event.content:
+        if event.isolation_scope:
             continue
-        text = "\n".join(
-            part.text.strip()
-            for part in event.content.parts or []
-            if part.text and part.text.strip()
-        )
-        if text:
+        text = ""
+        if event.content:
+            text = "\n".join(
+                part.text.strip()
+                for part in event.content.parts or []
+                if part.text and part.text.strip()
+            )
+        elif event.output:
+            text = event.output
+        if text and event.author in {"user", "committee_agent"}:
             role = "user" if event.author == "user" else "assistant"
             conversation.append({"role": role, "content": text})
     return conversation
