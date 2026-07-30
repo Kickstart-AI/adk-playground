@@ -1,0 +1,1 @@
+"""Committee agent package."""

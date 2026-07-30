@@ -27,6 +27,7 @@ Python `>=3.13,<3.14` is required.
 ```text
 .
 ├── deep_research_agent/   # Dynamic ADK workflow for research tasks
+├── committee_agent/       # Anonymous multi-model answer committee
 ├── hybrid_agent/          # Flow-driven customer-service agent
 ├── recursive_agent/       # Recursive agent experiment
 ├── .agents/               # Local agent skills and supporting metadata
@@ -49,6 +50,16 @@ It is built for research tasks. The planner checks whether the request is clear
 enough to run. If not, it asks clarifying questions. If the request is clear, the
 planner breaks it into independent subtasks, the workflow runs one researcher per
 subtask in parallel, and the writer turns the findings into a cited report.
+
+### `committee_agent`
+
+`committee_agent` asks GPT-5.6 Sol, Gemini 3.1 Pro, and Claude Fable 5 to answer
+the current question using the user-visible conversation history.
+
+It removes model identities, shuffles the answers independently for each model,
+and asks every model to rank all answers. A Borda count selects the winning
+answer. The model that wrote it then synthesizes the final response from all
+viewpoints without exposing models, candidates, or rankings to the user.
 
 ### `hybrid_agent`
 
@@ -98,6 +109,8 @@ cp .env.example my_agent/.env
 ```
 
 Then edit `my_agent/.env` and set `GOOGLE_API_KEY`.
+
+`committee_agent` also requires `OPENAI_API_KEY` and `ANTHROPIC_API_KEY`.
 
 Commit `.env.example`. Do not commit `.env`.
 
