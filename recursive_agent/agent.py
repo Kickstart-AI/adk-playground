@@ -1,5 +1,7 @@
 """Python ADK definition for the recursive agent."""
 
+from __future__ import annotations
+
 import logging
 from typing import Literal
 

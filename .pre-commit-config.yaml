@@ -33,7 +33,7 @@ repos:
       # type_check (+ strict typing where applicable) -> ty
       - id: ty-check
         name: Ty type check
-        entry: uvx ty check
+        entry: uv run ty check
         language: system
         pass_filenames: false
 
@@ -64,4 +64,4 @@ repos:
         entry: uvx --from detect-secrets detect-secrets-hook
         language: system
         pass_filenames: true
-        exclude: ^\.agents/
+        exclude: ^(\.agents/|skills-lock\.json$)
