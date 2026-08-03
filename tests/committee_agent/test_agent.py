@@ -11,12 +11,16 @@ import committee_agent.agent as agent_module
 import pytest
 from committee_agent.agent import (
     MODEL_IDS,
+    Answer,
+    collect_answers,
     collect_ballots,
+    create_member,
     run_committee_workflow,
     visible_conversation,
 )
 from committee_agent.committee import Candidate
 from google.adk.agents.context import Context
+from google.adk.models.lite_llm import LiteLlm
 from google.genai import types
 
 
@@ -110,3 +114,181 @@ def test_committee_workflow_flushes_langfuse_after_failure(monkeypatch) -> None:
 
     assert fake_langfuse.inputs == [{"question": "Current question"}]
     assert fake_langfuse.flush_count == 1
+
+
+@pytest.mark.parametrize(
+    ("model_id", "expected_route", "expected_args"),
+    [
+        (
+            "openai/gpt-5.6-sol",
+            "openai/responses/gpt-5.6-sol",
+            {
+                "reasoning_effort": "none",
+                "extra_body": {"tools": [{"type": "web_search", "search_context_size": "low"}]},
+            },
+        ),
+        (
+            "anthropic/claude-fable-5",
+            "anthropic/claude-fable-5",
+            {"web_search_options": {"search_context_size": "low"}},
+        ),
+        (
+            "gemini/gemini-3.1-pro-preview",
+            "gemini/gemini-3.1-pro-preview",
+            {"web_search_options": {"search_context_size": "low"}},
+        ),
+    ],
+)
+def test_answerer_models_use_provider_native_search(
+    model_id: str,
+    expected_route: str,
+    expected_args: dict,
+) -> None:
+    """Each answerer gets its exact provider-native hosted search configuration."""
+    member = create_member(0, model_id)
+    answerer_model = member.answerer.model
+
+    assert isinstance(answerer_model, LiteLlm)
+    assert answerer_model.model == expected_route
+    assert all(
+        answerer_model._additional_args.get(key) == value for key, value in expected_args.items()
+    )
+    assert "include" not in answerer_model._additional_args
+    assert member.answerer.tools == []
+
+
+def test_search_isolated_to_answerer_models() -> None:
+    """Rankers and synthesizers stay search-free and use another model object."""
+    for index, model_id in enumerate(MODEL_IDS):
+        member = create_member(index, model_id)
+        answerer_model = member.answerer.model
+        ranker_model = cast(LiteLlm, member.ranker.model)
+        synthesizer_model = cast(LiteLlm, member.synthesizer.model)
+
+        assert answerer_model is not ranker_model
+        assert answerer_model is not synthesizer_model
+        assert ranker_model is synthesizer_model
+        assert ranker_model._additional_args == {}
+        assert synthesizer_model._additional_args == {}
+        assert member.ranker.tools == []
+        assert member.synthesizer.tools == []
+
+
+def test_answerer_and_synthesizer_instructions_require_markdown_citations() -> None:
+    """Search and descriptive Markdown citation requirements remain explicit."""
+    member = create_member(0, MODEL_IDS[0])
+    answerer_instruction = cast(str, member.answerer.instruction)
+    synthesizer_instruction = cast(str, member.synthesizer.instruction)
+
+    assert "provider-native web search" in answerer_instruction
+    assert "descriptive Markdown links" in answerer_instruction
+    assert "bare URL" in answerer_instruction
+    assert "preserve useful source links" in synthesizer_instruction
+    assert "descriptive Markdown links" in synthesizer_instruction
+    assert "bare URL" in synthesizer_instruction
+    assert member.answerer.output_schema is Answer
+    assert member.synthesizer.output_schema is Answer
+
+
+def test_collect_answers_preserves_cited_answer_text() -> None:
+    """Collection keeps the complete structured answer, including source links."""
+    cited_answers = [
+        "[Official source](https://example.com/one)",
+        "[Reference source](https://example.com/two)",
+        "[Primary source](https://example.com/three)",
+    ]
+
+    class FakeContext:
+        async def run_node(self, member, _payload, run_id):
+            index = int(run_id.rsplit("_", 1)[1])
+            assert member is agent_module.MEMBERS[index].answerer
+            return {"answer": cited_answers[index]}
+
+    answers = asyncio.run(
+        collect_answers(
+            cast(Context, FakeContext()),
+            {"current_question": "Question", "conversation_history": []},
+        )
+    )
+
+    assert list(answers.values()) == cited_answers
+
+
+def test_collect_answers_propagates_provider_failure_without_fallback() -> None:
+    """A failed search-enabled answerer is called once and its error propagates."""
+    calls = []
+
+    class FakeContext:
+        async def run_node(self, member, _payload, run_id):
+            calls.append((member, run_id))
+            raise RuntimeError("provider unavailable")
+
+    with pytest.raises(RuntimeError, match="provider unavailable"):
+        asyncio.run(
+            collect_answers(
+                cast(Context, FakeContext()),
+                {"current_question": "Question", "conversation_history": []},
+            )
+        )
+
+    assert len(calls) == len(agent_module.MEMBERS)
+    assert {run_id for _member, run_id in calls} == {
+        f"answer_{index}" for index in range(len(agent_module.MEMBERS))
+    }
+    assert {id(member) for member, _run_id in calls} == {
+        id(committee_member.answerer) for committee_member in agent_module.MEMBERS
+    }
+
+
+def test_synthesis_receives_all_anonymous_citations_and_returns_them(monkeypatch) -> None:
+    """Synthesis receives cited text without model identity and preserves final output."""
+    cited_answers = [
+        "[Official source](https://example.com/one)",
+        "[Reference source](https://example.com/two)",
+        "[Primary source](https://example.com/three)",
+    ]
+    final_answer = "[Best source](https://example.com/final)"
+    captured_payload = {}
+
+    async def fake_collect_answers(_ctx, _payload):
+        return dict(
+            zip(
+                (member.model_id for member in agent_module.MEMBERS),
+                cited_answers,
+                strict=True,
+            )
+        )
+
+    async def fake_collect_ballots(_ctx, _payload, candidates, _rng):
+        return [[candidate.candidate_id for candidate in candidates] for _ in agent_module.MEMBERS]
+
+    class FakeContext:
+        session = SimpleNamespace(id="session-1", events=[])
+
+        async def run_node(self, member, payload, run_id):
+            assert run_id == "synthesis"
+            assert member in [
+                committee_member.synthesizer for committee_member in agent_module.MEMBERS
+            ]
+            captured_payload.update(payload)
+            return {"answer": final_answer}
+
+    monkeypatch.setattr(agent_module, "collect_answers", fake_collect_answers)
+    monkeypatch.setattr(agent_module, "collect_ballots", fake_collect_ballots)
+    monkeypatch.setattr(agent_module, "propagate_attributes", lambda **_kwargs: nullcontext())
+    monkeypatch.setattr(agent_module.langfuse, "update_current_span", lambda **_kwargs: None)
+    monkeypatch.setattr(agent_module.langfuse, "flush", lambda: None)
+
+    result = asyncio.run(
+        run_committee_workflow(
+            cast(Context, FakeContext()),
+            types.Content(parts=[types.Part(text="Question")]),
+        )
+    )
+
+    assert result == final_answer
+    candidate_answers = captured_payload["candidate_answers"]
+    assert {candidate["answer"] for candidate in candidate_answers} == set(cited_answers)
+    serialized = json.dumps(candidate_answers)
+    assert all(model_id not in serialized for model_id in MODEL_IDS)
+    assert all(member.answerer.name not in serialized for member in agent_module.MEMBERS)
