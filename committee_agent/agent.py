@@ -52,18 +52,21 @@ class Member:
 
 def create_member(index: int, model_id: str) -> Member:
     """Create generic agents for one privately identified model."""
+    answerer_model = create_answerer_model(model_id)
     model = LiteLlm(model=model_id)
     model_id = model_id.replace("/", "_").replace("-", "_").replace(".", "_")
     return Member(
         model_id=model_id,
         answerer=LlmAgent(
             name=f"member_{model_id}_answerer",
-            model=model,
+            model=answerer_model,
             include_contents="none",
             instruction=(
                 "Answer the user's current question using the supplied user-visible "
-                "conversation history. Produce a complete, accurate, and useful answer. "
-                "Return only the structured answer field."
+                "conversation history. Use the provider-native web search to verify "
+                "current facts. Cite sources inside the structured answer field as "
+                "descriptive Markdown links. Never include a bare URL. Produce a complete, "
+                "accurate, and useful answer. Return only the structured answer field."
             ),
             output_schema=Answer,
         ),
@@ -86,12 +89,35 @@ def create_member(index: int, model_id: str) -> Member:
             instruction=(
                 "Write the final answer to the user using all supplied anonymous candidate "
                 "answers and their collective rankings. Reconcile disagreements and retain "
-                "the strongest viewpoints. Do not mention candidates, rankings, models, or "
-                "the committee. Return only the structured answer field."
+                "the strongest viewpoints; preserve useful source links from candidate "
+                "answers as descriptive Markdown links, and never include a bare URL. Do "
+                "not mention candidates, rankings, models, or the committee. Return only "
+                "the structured answer field."
             ),
             output_schema=Answer,
         ),
     )
+
+
+def create_answerer_model(model_id: str) -> LiteLlm:
+    """Create a provider-native search model for an answerer."""
+    if model_id == "openai/gpt-5.6-sol":
+        return LiteLlm(
+            model="openai/responses/gpt-5.6-sol",
+            reasoning_effort="none",
+            extra_body={
+                "tools": [{"type": "web_search", "search_context_size": "low"}],
+            },
+        )
+    if model_id in {
+        "anthropic/claude-fable-5",
+        "gemini/gemini-3.1-pro-preview",
+    }:
+        return LiteLlm(
+            model=model_id,
+            web_search_options={"search_context_size": "low"},
+        )
+    raise ValueError(f"Unsupported committee model: {model_id}")
 
 
 MEMBERS = tuple(create_member(index, model_id) for index, model_id in enumerate(MODEL_IDS))
