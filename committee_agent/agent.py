@@ -13,7 +13,16 @@ from langfuse import get_client, observe, propagate_attributes
 from openinference.instrumentation.google_adk import GoogleADKInstrumentor
 from pydantic import BaseModel, Field
 
-from .committee import Candidate, anonymize_answers, ranking_view, select_winner
+from .committee import (
+    Candidate,
+    anonymize_answers,
+    ranking_view,
+    select_winner,
+    serialize_candidate,
+)
+from .schemas import AnswererAnswer, Source
+
+__all__ = ["Answer", "AnswererAnswer", "Source"]
 
 langfuse = get_client()
 GoogleADKInstrumentor().instrument()
@@ -66,9 +75,10 @@ def create_member(index: int, model_id: str) -> Member:
                 "conversation history. Use the provider-native web search to verify "
                 "current facts. Cite sources inside the structured answer field as "
                 "descriptive Markdown links. Never include a bare URL. Produce a complete, "
-                "accurate, and useful answer. Return only the structured answer field."
+                "accurate, and useful answer. Return only the structured answer and sources "
+                "fields."
             ),
-            output_schema=Answer,
+            output_schema=AnswererAnswer,
         ),
         ranker=LlmAgent(
             name=f"member_{model_id}_ranker",
@@ -76,9 +86,11 @@ def create_member(index: int, model_id: str) -> Member:
             include_contents="none",
             instruction=(
                 "Rank the anonymous candidate answers by correctness, relevance, reasoning, "
-                "and usefulness. The candidates are deliberately shuffled. Do not infer or "
-                "mention who wrote them. Return every candidate ID exactly once from best "
-                "to worst."
+                "and usefulness. The supplied source objects come from provider-native web "
+                "search and must not be presumed to be hallucinated links. Judge source "
+                "relevance, source quality, and whether each snippet supports the associated "
+                "answer. The candidates are deliberately shuffled. Do not infer or mention "
+                "who wrote them. Return every candidate ID exactly once from best to worst."
             ),
             output_schema=Ranking,
         ),
@@ -152,7 +164,7 @@ def content_text(node_input) -> str:
     )
 
 
-async def collect_answers(ctx: Context, payload: dict) -> dict[str, str]:
+async def collect_answers(ctx: Context, payload: dict) -> dict[str, AnswererAnswer]:
     """Ask all committee members for independent answers in parallel."""
     responses = await asyncio.gather(
         *(
@@ -161,7 +173,7 @@ async def collect_answers(ctx: Context, payload: dict) -> dict[str, str]:
         )
     )
     return {
-        member.model_id: Answer.model_validate(response).answer
+        member.model_id: AnswererAnswer.model_validate(response)
         for member, response in zip(MEMBERS, responses, strict=True)
     }
 
@@ -176,7 +188,9 @@ async def collect_ballots(
     ranking_payloads = [
         {
             **payload,
-            "candidates": [candidate.__dict__ for candidate in ranking_view(candidates, rng)],
+            "candidates": [
+                serialize_candidate(candidate) for candidate in ranking_view(candidates, rng)
+            ],
         }
         for _ in MEMBERS
     ]
@@ -228,7 +242,8 @@ async def run_committee_workflow(ctx: Context, node_input) -> str:
                 {
                     **payload,
                     "candidate_answers": [
-                        candidate.__dict__ for candidate in ranking_view(candidates, rng)
+                        serialize_candidate(candidate)
+                        for candidate in ranking_view(candidates, rng)
                     ],
                     "collective_rankings": ballots,
                 },

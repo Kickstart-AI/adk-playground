@@ -12,6 +12,8 @@ import pytest
 from committee_agent.agent import (
     MODEL_IDS,
     Answer,
+    AnswererAnswer,
+    Source,
     collect_answers,
     collect_ballots,
     create_member,
@@ -53,7 +55,7 @@ def test_visible_conversation_excludes_internal_events_and_agent_names() -> None
 def test_ranking_payloads_contain_no_model_ids() -> None:
     """Every judge must receive only shuffled candidate IDs and answer text."""
     candidates = [
-        Candidate(f"response_{index}", model_id, f"Answer {index}")
+        Candidate(f"response_{index}", model_id, f"Answer {index}", [])
         for index, model_id in enumerate(MODEL_IDS)
     ]
     payloads = []
@@ -186,23 +188,40 @@ def test_answerer_and_synthesizer_instructions_require_markdown_citations() -> N
     assert "preserve useful source links" in synthesizer_instruction
     assert "descriptive Markdown links" in synthesizer_instruction
     assert "bare URL" in synthesizer_instruction
-    assert member.answerer.output_schema is Answer
+    ranker_instruction = cast(str, member.ranker.instruction)
+    assert "provider-native web search" in ranker_instruction
+    assert "relevance" in ranker_instruction
+    assert "quality" in ranker_instruction
+    assert "snippet" in ranker_instruction
+    assert member.answerer.output_schema is AnswererAnswer
     assert member.synthesizer.output_schema is Answer
 
 
 def test_collect_answers_preserves_cited_answer_text() -> None:
     """Collection keeps the complete structured answer, including source links."""
     cited_answers = [
-        "[Official source](https://example.com/one)",
-        "[Reference source](https://example.com/two)",
-        "[Primary source](https://example.com/three)",
+        AnswererAnswer(
+            answer="[Official source](https://example.com/one)",
+            sources=[
+                Source(url="https://example.com/one", title="One", snippet="First"),
+                Source(url="https://example.com/one", title="One duplicate", snippet="Second"),
+            ],
+        ),
+        AnswererAnswer(
+            answer="[Reference source](https://example.com/two)",
+            sources=[Source(url="https://example.com/two", title="Two", snippet="Second")],
+        ),
+        AnswererAnswer(
+            answer="[Primary source](https://example.com/three)",
+            sources=[],
+        ),
     ]
 
     class FakeContext:
         async def run_node(self, member, _payload, run_id):
             index = int(run_id.rsplit("_", 1)[1])
             assert member is agent_module.MEMBERS[index].answerer
-            return {"answer": cited_answers[index]}
+            return cited_answers[index].model_dump()
 
     answers = asyncio.run(
         collect_answers(
@@ -212,6 +231,51 @@ def test_collect_answers_preserves_cited_answer_text() -> None:
     )
 
     assert list(answers.values()) == cited_answers
+
+
+def test_collect_ballots_serializes_ordered_sources_without_provider_metadata() -> None:
+    """Ranker payloads contain only exact provider-neutral source dictionaries."""
+    sources = [
+        Source(url="HTTPS://Example.com/one?b=2&a=1", title="First", snippet="One"),
+        Source(url="https://example.com/two#fragment", title="Second", snippet="Two"),
+        Source(url="HTTPS://Example.com/one?b=2&a=1", title="First", snippet="One"),
+    ]
+    candidates = [
+        Candidate(
+            candidate_id="response_a",
+            model="openai/gpt-5.6-sol",
+            answer="[One](https://example.com/one)",
+            sources=sources,
+        )
+    ]
+    payloads = []
+
+    class FakeContext:
+        async def run_node(self, _agent, payload, run_id):
+            payloads.append((run_id, payload))
+            return {"candidate_ids": ["response_a"], "reasoning": "Supported."}
+
+    ballots = asyncio.run(
+        collect_ballots(
+            cast(Context, FakeContext()),
+            {"current_question": "Question", "conversation_history": []},
+            candidates,
+            random.Random(3),
+        )
+    )
+
+    assert ballots == [["response_a"]] * len(agent_module.MEMBERS)
+    for _run_id, payload in payloads:
+        assert payload["candidates"] == [
+            {
+                "candidate_id": "response_a",
+                "answer": "[One](https://example.com/one)",
+                "sources": [source.model_dump() for source in sources],
+            }
+        ]
+        serialized = json.dumps(payload)
+        assert "openai/gpt-5.6-sol" not in serialized
+        assert "member_0_answerer" not in serialized
 
 
 def test_collect_answers_propagates_provider_failure_without_fallback() -> None:
@@ -254,7 +318,19 @@ def test_synthesis_receives_all_anonymous_citations_and_returns_them(monkeypatch
         return dict(
             zip(
                 (member.model_id for member in agent_module.MEMBERS),
-                cited_answers,
+                [
+                    AnswererAnswer(
+                        answer=answer,
+                        sources=[
+                            Source(
+                                url=f"https://example.com/{index}",
+                                title=f"Source {index}",
+                                snippet=f"Snippet {index}",
+                            )
+                        ],
+                    )
+                    for index, answer in enumerate(cited_answers)
+                ],
                 strict=True,
             )
         )
@@ -289,6 +365,14 @@ def test_synthesis_receives_all_anonymous_citations_and_returns_them(monkeypatch
     assert result == final_answer
     candidate_answers = captured_payload["candidate_answers"]
     assert {candidate["answer"] for candidate in candidate_answers} == set(cited_answers)
+    assert all(
+        set(source) == {"url", "title", "snippet"}
+        for candidate in candidate_answers
+        for source in candidate["sources"]
+    )
+    assert {
+        source["url"] for candidate in candidate_answers for source in candidate["sources"]
+    } == {f"https://example.com/{index}" for index in range(len(cited_answers))}
     serialized = json.dumps(candidate_answers)
     assert all(model_id not in serialized for model_id in MODEL_IDS)
     assert all(member.answerer.name not in serialized for member in agent_module.MEMBERS)
