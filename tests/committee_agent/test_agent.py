@@ -28,6 +28,7 @@ from google.adk.models.lite_llm import LiteLlm
 from google.adk.models.llm_request import LlmRequest
 from google.genai import types
 from litellm.types.utils import ModelResponse
+from pydantic import ValidationError
 
 
 def text_event(author: str, text: str, isolation_scope: str | None = None) -> SimpleNamespace:
@@ -523,30 +524,167 @@ def test_collect_ballots_serializes_ordered_sources_without_provider_metadata() 
         assert "member_0_answerer" not in serialized
 
 
-def test_collect_answers_propagates_provider_failure_without_fallback() -> None:
-    """A failed search-enabled answerer is called once and its error propagates."""
+class AuthenticationFailureError(Exception):
+    """Synthetic provider authentication failure."""
+
+
+class RateLimitFailureError(Exception):
+    """Synthetic provider rate-limit failure."""
+
+
+class NetworkFailureError(Exception):
+    """Synthetic provider network failure."""
+
+
+class ProviderApiFailureError(Exception):
+    """Synthetic provider API failure."""
+
+
+FAILURE_CASES = (
+    pytest.param("authentication", AuthenticationFailureError("invalid credentials"), id="auth"),
+    pytest.param("rate_limit", RateLimitFailureError("quota exhausted"), id="rate-limit"),
+    pytest.param("network", NetworkFailureError("connection lost"), id="network"),
+    pytest.param(
+        "provider_api",
+        ProviderApiFailureError("provider unavailable"),
+        id="provider-api",
+    ),
+    pytest.param("malformed", None, id="malformed-structured-response"),
+)
+
+
+def assert_search_enabled_answerer(member, model_id: str) -> None:
+    """Assert a member uses the configured provider-native answerer model."""
+    model = cast(LiteLlm, member.answerer.model)
+    expected_route = "openai/responses/gpt-5.6-sol" if model_id == MODEL_IDS[0] else model_id
+
+    assert model.model == expected_route
+    if model_id == MODEL_IDS[0]:
+        assert model._additional_args == {
+            "reasoning_effort": "none",
+            "extra_body": {
+                "tools": [{"type": "web_search", "search_context_size": "low"}],
+            },
+        }
+    else:
+        assert model._additional_args == {
+            "web_search_options": {"search_context_size": "low"},
+        }
+
+
+@pytest.mark.parametrize(("model_index", "model_id"), enumerate(MODEL_IDS))
+@pytest.mark.parametrize(("failure_class", "failure"), FAILURE_CASES)
+def test_provider_failures_never_fall_back_or_start_downstream_nodes(
+    monkeypatch,
+    model_index: int,
+    model_id: str,
+    failure_class: str,
+    failure: Exception | None,
+) -> None:
+    """Every provider failure stays explicit without fallback, ranking, or synthesis."""
     calls = []
+    downstream_calls = []
 
     class FakeContext:
-        async def run_node(self, member, _payload, run_id):
-            calls.append((member, run_id))
-            raise RuntimeError("provider unavailable")
+        session = SimpleNamespace(id="session-1", events=[])
 
-    with pytest.raises(RuntimeError, match="provider unavailable"):
+        async def run_node(self, workflow_agent, _payload, run_id):
+            if run_id.startswith("answer_"):
+                answer_index = int(run_id.rsplit("_", 1)[1])
+                member = agent_module.MEMBERS[answer_index]
+                assert workflow_agent is member.answerer
+                assert_search_enabled_answerer(member, MODEL_IDS[answer_index])
+                calls.append((answer_index, workflow_agent))
+                if answer_index == model_index:
+                    if failure_class == "malformed":
+                        return {"answer": "Missing required sources"}
+                    raise cast(Exception, failure)
+                return {"answer": f"Answer {answer_index}", "sources": []}
+            downstream_calls.append(run_id)
+            raise AssertionError(f"Unexpected downstream call: {run_id}")
+
+    monkeypatch.setattr(agent_module, "propagate_attributes", lambda **_kwargs: nullcontext())
+    monkeypatch.setattr(agent_module.langfuse, "update_current_span", lambda **_kwargs: None)
+    monkeypatch.setattr(agent_module.langfuse, "flush", lambda: None)
+
+    if failure_class == "malformed":
+        expected_exception = pytest.raises(ValidationError)
+    else:
+        expected_exception = pytest.raises(type(cast(Exception, failure)))
+
+    with expected_exception as captured:
         asyncio.run(
-            collect_answers(
+            run_committee_workflow(
                 cast(Context, FakeContext()),
-                {"current_question": "Question", "conversation_history": []},
+                types.Content(parts=[types.Part(text="Question")]),
             )
         )
 
-    assert len(calls) == len(agent_module.MEMBERS)
-    assert {run_id for _member, run_id in calls} == {
-        f"answer_{index}" for index in range(len(agent_module.MEMBERS))
-    }
-    assert {id(member) for member, _run_id in calls} == {
-        id(committee_member.answerer) for committee_member in agent_module.MEMBERS
-    }
+    assert [index for index, _answerer in calls].count(model_index) == 1
+    assert len(calls) == len(MODEL_IDS)
+    assert len({id(answerer) for _index, answerer in calls}) == len(MODEL_IDS)
+    if failure is not None:
+        assert captured.value is failure
+    assert downstream_calls == []
+
+
+def test_gemini_empty_sources_without_tool_invocation_reaches_synthesis(monkeypatch) -> None:
+    """Gemini may return no sources while the committee still ranks and synthesizes."""
+    calls = []
+    synthesis_payload = {}
+
+    class FakeContext:
+        session = SimpleNamespace(id="session-1", events=[])
+
+        async def run_node(self, workflow_agent, payload, run_id):
+            calls.append(run_id)
+            if run_id.startswith("answer_"):
+                answer_index = int(run_id.rsplit("_", 1)[1])
+                member = agent_module.MEMBERS[answer_index]
+                assert workflow_agent is member.answerer
+                assert_search_enabled_answerer(member, MODEL_IDS[answer_index])
+                answer = "Gemini answer without tool invocation"
+                if answer_index != 1:
+                    answer = f"Answer {answer_index}"
+                return {"answer": answer, "sources": []}
+            if run_id.startswith("ranking_"):
+                return {
+                    "candidate_ids": [
+                        candidate["candidate_id"] for candidate in payload["candidates"]
+                    ],
+                    "reasoning": "Valid empty-source answer.",
+                }
+            assert run_id == "synthesis"
+            synthesis_payload.update(payload)
+            return {"answer": "Final answer"}
+
+    monkeypatch.setattr(agent_module, "propagate_attributes", lambda **_kwargs: nullcontext())
+    monkeypatch.setattr(agent_module.langfuse, "update_current_span", lambda **_kwargs: None)
+    monkeypatch.setattr(agent_module.langfuse, "flush", lambda: None)
+
+    result = asyncio.run(
+        run_committee_workflow(
+            cast(Context, FakeContext()),
+            types.Content(parts=[types.Part(text="Question")]),
+        )
+    )
+
+    assert result == "Final answer"
+    assert calls[:3] == ["answer_0", "answer_1", "answer_2"]
+    assert set(calls[3:6]) == {"ranking_0", "ranking_1", "ranking_2"}
+    assert calls[6:] == ["synthesis"]
+    gemini_candidates = [
+        candidate
+        for candidate in synthesis_payload["candidate_answers"]
+        if candidate["answer"] == "Gemini answer without tool invocation"
+    ]
+    assert gemini_candidates == [
+        {
+            "candidate_id": gemini_candidates[0]["candidate_id"],
+            "answer": "Gemini answer without tool invocation",
+            "sources": [],
+        }
+    ]
 
 
 def test_synthesis_receives_all_anonymous_citations_and_returns_them(monkeypatch) -> None:
