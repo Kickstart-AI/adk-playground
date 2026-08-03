@@ -25,6 +25,7 @@ class Source(BaseModel):
         if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
             raise ValueError("url must be a valid HTTP(S) URL")
         try:
+            _ = parsed.port
             if not parsed.hostname:
                 raise ValueError("url must be a valid HTTP(S) URL")
         except ValueError as error:

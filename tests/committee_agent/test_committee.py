@@ -80,6 +80,8 @@ def test_structured_sources_preserve_order_duplicates_and_exact_values() -> None
         {"url": "ftp://example.com", "title": "Title", "snippet": "Snippet"},
         {"url": "example.com", "title": "Title", "snippet": "Snippet"},
         {"url": "https://", "title": "Title", "snippet": "Snippet"},
+        {"url": "https://example.com:not-a-port", "title": "Title", "snippet": "Snippet"},
+        {"url": "https://example.com:99999", "title": "Title", "snippet": "Snippet"},
         {"url": " https://example.com", "title": "Title", "snippet": "Snippet"},
         {"url": "https://example.com ", "title": "Title", "snippet": "Snippet"},
         {"url": "https://example.com", "title": "", "snippet": "Snippet"},
@@ -111,6 +113,20 @@ def test_answerer_answer_accepts_empty_sources_and_preserves_values() -> None:
         "snippet": "Snippet with exact spacing",
     }
     assert empty.sources == []
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://example.com:0/path",
+        "https://example.com:65535/path",
+    ],
+)
+def test_source_accepts_boundary_ports_without_rewriting(url: str) -> None:
+    """Valid boundary ports remain accepted and byte-for-byte unchanged."""
+    source = Source(url=url, title="Title", snippet="Snippet")
+
+    assert source.url == url
 
 
 def test_select_winner_uses_borda_scores() -> None:
