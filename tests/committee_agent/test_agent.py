@@ -13,6 +13,7 @@ from committee_agent.agent import (
     MODEL_IDS,
     Answer,
     AnswererAnswer,
+    AnthropicAnswererClient,
     Source,
     collect_answers,
     collect_ballots,
@@ -20,10 +21,13 @@ from committee_agent.agent import (
     run_committee_workflow,
     visible_conversation,
 )
+from committee_agent.anthropic import AnthropicAnswererModel
 from committee_agent.committee import Candidate
 from google.adk.agents.context import Context
 from google.adk.models.lite_llm import LiteLlm
+from google.adk.models.llm_request import LlmRequest
 from google.genai import types
+from litellm.types.utils import ModelResponse
 
 
 def text_event(author: str, text: str, isolation_scope: str | None = None) -> SimpleNamespace:
@@ -195,6 +199,191 @@ def test_answerer_and_synthesizer_instructions_require_markdown_citations() -> N
     assert "snippet" in ranker_instruction
     assert member.answerer.output_schema is AnswererAnswer
     assert member.synthesizer.output_schema is Answer
+
+
+def test_anthropic_client_forces_targeted_request_to_non_streaming() -> None:
+    """The targeted hosted-search request forwards exactly one completed call."""
+    captured = {}
+    calls = []
+    intermediate_query = {"query": "latest"}
+    with pytest.raises(ValueError):
+        AnswererAnswer.model_validate(intermediate_query)
+
+    class FakeClient(AnthropicAnswererClient):
+        async def _provider_acompletion(self, model, messages, tools, **kwargs):
+            calls.append(1)
+            captured.update(model=model, messages=messages, tools=tools, kwargs=kwargs)
+            return ModelResponse(
+                model=model,
+                choices=[
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": '{"answer":"Final","sources":[]}',
+                            "tool_calls": [
+                                {
+                                    "type": "function",
+                                    "id": "search-1",
+                                    "function": {
+                                        "name": "web_search",
+                                        "arguments": '{"query":"latest"}',
+                                    },
+                                },
+                                {
+                                    "type": "function",
+                                    "id": "other-1",
+                                    "function": {
+                                        "name": "lookup",
+                                        "arguments": '{"key":"value"}',
+                                    },
+                                },
+                            ],
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+            )
+
+    result = asyncio.run(
+        FakeClient().acompletion(
+            model="anthropic/claude-fable-5",
+            messages=[{"role": "user", "content": "Question"}],
+            tools=[],
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "AnswererAnswer",
+                    "strict": True,
+                    "schema": {"type": "object", "required": ["answer", "sources"]},
+                },
+            },
+            web_search_options={"search_context_size": "low"},
+            sentinel="preserved",
+            stream=True,
+        )
+    )
+
+    assert len(calls) == 1
+    assert captured["kwargs"]["stream"] is False
+    assert captured["kwargs"]["sentinel"] == "preserved"
+    assert "response_format" not in captured["kwargs"]
+    assert captured["kwargs"]["output_config"] == {
+        "format": {
+            "type": "json_schema",
+            "schema": {"type": "object", "required": ["answer", "sources"]},
+        }
+    }
+    assert result.choices[0].message.content == '{"answer":"Final","sources":[]}'
+    assert [call.function.name for call in result.choices[0].message.tool_calls] == ["lookup"]
+
+
+def test_anthropic_non_target_request_is_delegated_unchanged() -> None:
+    """Requests outside the answerer activation matrix retain all arguments."""
+    captured = {}
+
+    class FakeClient(AnthropicAnswererClient):
+        async def _provider_acompletion(self, model, messages, tools, **kwargs):
+            captured.update(model=model, messages=messages, tools=tools, kwargs=kwargs)
+            return "response"
+
+    marker = {"type": "json_object"}
+    result = asyncio.run(
+        FakeClient().acompletion(
+            model="anthropic/other-model",
+            messages=["message"],
+            tools=["tool"],
+            response_format=marker,
+            stream=True,
+            sentinel="preserved",
+        )
+    )
+
+    assert result == "response"
+    assert captured == {
+        "model": "anthropic/other-model",
+        "messages": ["message"],
+        "tools": ["tool"],
+        "kwargs": {
+            "response_format": marker,
+            "stream": True,
+            "sentinel": "preserved",
+        },
+    }
+
+
+def test_anthropic_answerer_emits_one_completed_response_for_streaming_request(
+    monkeypatch,
+) -> None:
+    """The adapter yields one final response instead of an intermediate query."""
+    member = create_member(0, "anthropic/claude-fable-5")
+    model = cast(AnthropicAnswererModel, member.answerer.model)
+    client = cast(AnthropicAnswererClient, model.llm_client)
+    response = ModelResponse(
+        model="anthropic/claude-fable-5",
+        choices=[
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": '{"answer":"Final","sources":[]}',
+                },
+                "finish_reason": "stop",
+            }
+        ],
+    )
+
+    async def fake_completion(*_args, **_kwargs):
+        return response
+
+    monkeypatch.setattr(client, "_provider_acompletion", fake_completion)
+    request = LlmRequest(
+        model="anthropic/claude-fable-5",
+        contents=[types.Content(role="user", parts=[types.Part.from_text(text="Question")])],
+    )
+    request.set_output_schema(AnswererAnswer)
+
+    async def collect_responses():
+        return [response async for response in model.generate_content_async(request, stream=True)]
+
+    results = asyncio.run(collect_responses())
+
+    assert len(results) == 1
+    assert results[0].partial is False
+    assert results[0].turn_complete is True
+    assert AnswererAnswer.model_validate_json(results[0].content.parts[0].text).answer == "Final"
+
+
+def test_anthropic_malformed_final_response_is_not_repaired(monkeypatch) -> None:
+    """A malformed completed answer remains a schema validation failure."""
+    member = create_member(0, "anthropic/claude-fable-5")
+    model = cast(AnthropicAnswererModel, member.answerer.model)
+    client = cast(AnthropicAnswererClient, model.llm_client)
+    response = ModelResponse(
+        model="anthropic/claude-fable-5",
+        choices=[
+            {
+                "message": {"role": "assistant", "content": '{"query":"still malformed"}'},
+                "finish_reason": "stop",
+            }
+        ],
+    )
+
+    async def fake_completion(*_args, **_kwargs):
+        return response
+
+    monkeypatch.setattr(client, "_provider_acompletion", fake_completion)
+    request = LlmRequest(
+        model="anthropic/claude-fable-5",
+        contents=[types.Content(role="user", parts=[types.Part.from_text(text="Question")])],
+    )
+    request.set_output_schema(AnswererAnswer)
+
+    async def collect_responses():
+        return [item async for item in model.generate_content_async(request, stream=True)]
+
+    result = asyncio.run(collect_responses())
+    content = result[0].content.parts[0].text
+    with pytest.raises(ValueError):
+        AnswererAnswer.model_validate_json(content)
 
 
 def test_collect_answers_preserves_cited_answer_text() -> None:

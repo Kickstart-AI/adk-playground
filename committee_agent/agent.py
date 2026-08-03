@@ -13,6 +13,7 @@ from langfuse import get_client, observe, propagate_attributes
 from openinference.instrumentation.google_adk import GoogleADKInstrumentor
 from pydantic import BaseModel, Field
 
+from .anthropic import AnthropicAnswererClient, AnthropicAnswererModel
 from .committee import (
     Candidate,
     anonymize_answers,
@@ -125,6 +126,12 @@ def create_answerer_model(model_id: str) -> LiteLlm:
         "anthropic/claude-fable-5",
         "gemini/gemini-3.1-pro-preview",
     }:
+        if model_id == "anthropic/claude-fable-5":
+            return AnthropicAnswererModel(
+                model=model_id,
+                llm_client=AnthropicAnswererClient(),
+                web_search_options={"search_context_size": "low"},
+            )
         return LiteLlm(
             model=model_id,
             web_search_options={"search_context_size": "low"},
