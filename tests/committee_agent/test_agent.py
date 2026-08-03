@@ -201,6 +201,18 @@ def test_answerer_and_synthesizer_instructions_require_markdown_citations() -> N
     assert member.synthesizer.output_schema is Answer
 
 
+def test_all_answerer_instructions_prohibit_intermediate_search_output() -> None:
+    """Every provider answerer emits only tool calls before one final result."""
+    for model_id in MODEL_IDS:
+        instruction = cast(str, create_member(0, model_id).answerer.instruction)
+        assert "only provider-owned tool calls" in instruction
+        assert "intermediate answer text" in instruction
+        assert "search-query JSON" in instruction
+        assert "partial structured output" in instruction
+        assert "exactly one final AnswererAnswer" in instruction
+        assert "After all tool use is complete" in instruction
+
+
 def test_anthropic_client_forces_targeted_request_to_non_streaming() -> None:
     """The targeted hosted-search request forwards exactly one completed call."""
     captured = {}
@@ -275,6 +287,50 @@ def test_anthropic_client_forces_targeted_request_to_non_streaming() -> None:
     }
     assert result.choices[0].message.content == '{"answer":"Final","sources":[]}'
     assert [call.function.name for call in result.choices[0].message.tool_calls] == ["lookup"]
+
+
+def test_anthropic_client_preserves_application_web_search_calls() -> None:
+    """An application-owned web_search call is not mistaken for hosted search."""
+
+    class FakeClient(AnthropicAnswererClient):
+        async def _provider_acompletion(self, model, messages, tools, **kwargs):
+            return ModelResponse(
+                model=model,
+                choices=[
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": '{"query":"application"}',
+                            "tool_calls": [
+                                {
+                                    "type": "function",
+                                    "id": "app-search",
+                                    "function": {
+                                        "name": "web_search",
+                                        "arguments": '{"query":"application"}',
+                                    },
+                                }
+                            ],
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+            )
+
+    result = asyncio.run(
+        FakeClient().acompletion(
+            model="anthropic/claude-fable-5",
+            messages=[],
+            tools=[{"type": "function", "function": {"name": "web_search"}}],
+            response_format={
+                "type": "json_schema",
+                "json_schema": {"schema": {"type": "object"}},
+            },
+            web_search_options={"search_context_size": "low"},
+        )
+    )
+
+    assert result.choices[0].message.tool_calls[0].function.name == "web_search"
 
 
 def test_anthropic_non_target_request_is_delegated_unchanged() -> None:

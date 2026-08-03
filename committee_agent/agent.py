@@ -74,10 +74,13 @@ def create_member(index: int, model_id: str) -> Member:
             instruction=(
                 "Answer the user's current question using the supplied user-visible "
                 "conversation history. Use the provider-native web search to verify "
-                "current facts. Cite sources inside the structured answer field as "
-                "descriptive Markdown links. Never include a bare URL. Produce a complete, "
-                "accurate, and useful answer. Return only the structured answer and sources "
-                "fields."
+                "current facts. While search is in progress, emit only provider-owned "
+                "tool calls: never emit intermediate answer text, search-query JSON, or "
+                "partial structured output. After all tool use is complete, emit exactly "
+                "one final AnswererAnswer. Cite sources inside the structured answer field "
+                "as descriptive Markdown links. Never include a bare URL. Produce a "
+                "complete, accurate, and useful answer. Return only the structured answer "
+                "and sources fields."
             ),
             output_schema=AnswererAnswer,
         ),

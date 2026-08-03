@@ -35,6 +35,11 @@ def _remove_provider_search_calls(response: Any) -> Any:
     return filtered
 
 
+def _has_application_web_search(tools: list[dict] | None) -> bool:
+    """Check whether the request declares its own web_search function."""
+    return any(_tool_call_name(tool) == "web_search" for tool in tools or [])
+
+
 class AnthropicAnswererClient(LiteLLMClient):
     """Force hosted-search answerer requests to complete before returning."""
 
@@ -63,7 +68,7 @@ class AnthropicAnswererClient(LiteLLMClient):
                 "format": {"type": "json_schema", "schema": native_format["schema"]},
             }
         response = await self._provider_acompletion(model, messages, tools, **provider_kwargs)
-        if targeted:
+        if targeted and not _has_application_web_search(tools):
             return _remove_provider_search_calls(response)
         return response
 
