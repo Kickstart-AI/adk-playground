@@ -7,8 +7,11 @@ from dataclasses import dataclass
 from google.adk import Workflow
 from google.adk.agents import LlmAgent
 from google.adk.agents.context import Context
+from google.adk.models import BaseLlm, Gemini
 from google.adk.models.lite_llm import LiteLlm
+from google.adk.tools import google_search, url_context
 from google.adk.workflow import node
+from google.genai import types
 from langfuse import get_client, observe, propagate_attributes
 from openinference.instrumentation.google_adk import GoogleADKInstrumentor
 from pydantic import BaseModel, Field
@@ -63,7 +66,7 @@ class Member:
 def create_member(index: int, model_id: str) -> Member:
     """Create generic agents for one privately identified model."""
     answerer_model = create_answerer_model(model_id)
-    model = LiteLlm(model=model_id)
+    model = create_model(model_id)
     model_id = model_id.replace("/", "_").replace("-", "_").replace(".", "_")
     return Member(
         model_id=model_id,
@@ -83,6 +86,14 @@ def create_member(index: int, model_id: str) -> Member:
                 "and sources fields."
             ),
             output_schema=AnswererAnswer,
+            tools=[google_search, url_context] if isinstance(answerer_model, Gemini) else [],
+            generate_content_config=(
+                types.GenerateContentConfig(
+                    tool_config=types.ToolConfig(include_server_side_tool_invocations=True)
+                )
+                if isinstance(answerer_model, Gemini)
+                else None
+            ),
         ),
         ranker=LlmAgent(
             name=f"member_{model_id}_ranker",
@@ -115,7 +126,14 @@ def create_member(index: int, model_id: str) -> Member:
     )
 
 
-def create_answerer_model(model_id: str) -> LiteLlm:
+def create_model(model_id: str) -> BaseLlm:
+    """Create the native model route when ADK supports the provider."""
+    if model_id == "gemini/gemini-3.1-pro-preview":
+        return Gemini(model=model_id.removeprefix("gemini/"))
+    return LiteLlm(model=model_id)
+
+
+def create_answerer_model(model_id: str) -> BaseLlm:
     """Create a provider-native search model for an answerer."""
     if model_id == "openai/gpt-5.6-sol":
         return LiteLlm(
@@ -125,20 +143,14 @@ def create_answerer_model(model_id: str) -> LiteLlm:
                 "tools": [{"type": "web_search", "search_context_size": "low"}],
             },
         )
-    if model_id in {
-        "anthropic/claude-fable-5",
-        "gemini/gemini-3.1-pro-preview",
-    }:
-        if model_id == "anthropic/claude-fable-5":
-            return AnthropicAnswererModel(
-                model=model_id,
-                llm_client=AnthropicAnswererClient(),
-                web_search_options={"search_context_size": "low"},
-            )
-        return LiteLlm(
+    if model_id == "anthropic/claude-fable-5":
+        return AnthropicAnswererModel(
             model=model_id,
+            llm_client=AnthropicAnswererClient(),
             web_search_options={"search_context_size": "low"},
         )
+    if model_id == "gemini/gemini-3.1-pro-preview":
+        return create_model(model_id)
     raise ValueError(f"Unsupported committee model: {model_id}")
 
 
