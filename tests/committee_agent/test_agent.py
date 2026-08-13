@@ -24,8 +24,10 @@ from committee_agent.agent import (
 from committee_agent.anthropic import AnthropicAnswererModel
 from committee_agent.committee import Candidate
 from google.adk.agents.context import Context
+from google.adk.models import Gemini
 from google.adk.models.lite_llm import LiteLlm
 from google.adk.models.llm_request import LlmRequest
+from google.adk.tools import google_search, url_context
 from google.genai import types
 from litellm.types.utils import ModelResponse
 from pydantic import ValidationError
@@ -155,13 +157,22 @@ def test_answerer_models_use_provider_native_search(
     member = create_member(0, model_id)
     answerer_model = member.answerer.model
 
-    assert isinstance(answerer_model, LiteLlm)
-    assert answerer_model.model == expected_route
-    assert all(
-        answerer_model._additional_args.get(key) == value for key, value in expected_args.items()
-    )
-    assert "include" not in answerer_model._additional_args
-    assert member.answerer.tools == []
+    if model_id.startswith("gemini/"):
+        assert isinstance(answerer_model, Gemini)
+        assert answerer_model.model == "gemini-3.1-pro-preview"
+        assert member.answerer.tools == [google_search, url_context]
+        assert member.answerer.generate_content_config == types.GenerateContentConfig(
+            tool_config=types.ToolConfig(include_server_side_tool_invocations=True)
+        )
+    else:
+        assert isinstance(answerer_model, LiteLlm)
+        assert answerer_model.model == expected_route
+        assert all(
+            answerer_model._additional_args.get(key) == value
+            for key, value in expected_args.items()
+        )
+        assert "include" not in answerer_model._additional_args
+        assert member.answerer.tools == []
 
 
 def test_search_isolated_to_answerer_models() -> None:
@@ -169,14 +180,18 @@ def test_search_isolated_to_answerer_models() -> None:
     for index, model_id in enumerate(MODEL_IDS):
         member = create_member(index, model_id)
         answerer_model = member.answerer.model
-        ranker_model = cast(LiteLlm, member.ranker.model)
-        synthesizer_model = cast(LiteLlm, member.synthesizer.model)
+        ranker_model = member.ranker.model
+        synthesizer_model = member.synthesizer.model
 
         assert answerer_model is not ranker_model
         assert answerer_model is not synthesizer_model
         assert ranker_model is synthesizer_model
-        assert ranker_model._additional_args == {}
-        assert synthesizer_model._additional_args == {}
+        if model_id.startswith("gemini/"):
+            assert isinstance(ranker_model, Gemini)
+            assert ranker_model.model == "gemini-3.1-pro-preview"
+        else:
+            assert isinstance(ranker_model, LiteLlm)
+            assert ranker_model._additional_args == {}
         assert member.ranker.tools == []
         assert member.synthesizer.tools == []
 
@@ -555,7 +570,14 @@ FAILURE_CASES = (
 
 def assert_search_enabled_answerer(member, model_id: str) -> None:
     """Assert a member uses the configured provider-native answerer model."""
-    model = cast(LiteLlm, member.answerer.model)
+    model = member.answerer.model
+    if model_id.startswith("gemini/"):
+        assert isinstance(model, Gemini)
+        assert model.model == "gemini-3.1-pro-preview"
+        assert member.answerer.tools == [google_search, url_context]
+        return
+
+    assert isinstance(model, LiteLlm)
     expected_route = "openai/responses/gpt-5.6-sol" if model_id == MODEL_IDS[0] else model_id
 
     assert model.model == expected_route

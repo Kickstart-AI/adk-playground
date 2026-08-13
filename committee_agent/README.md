@@ -10,6 +10,8 @@ For each user turn, all models receive the current question and the complete
 user-visible conversation. They produce answers in parallel using provider-native,
 server-side web search. Each answer includes descriptive inline Markdown citations
 and an ordered list of source objects containing only `url`, `title`, and `snippet`.
+The native Gemini answerer also uses URL Context and enables server-side tool
+invocations so its built-in tools work with structured output.
 The Anthropic answerer uses a completed-response adapter so intermediate search
 queries never appear as answer output.
 
