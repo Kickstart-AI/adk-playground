@@ -11,13 +11,26 @@ import committee_agent.agent as agent_module
 import pytest
 from committee_agent.agent import (
     MODEL_IDS,
+    Answer,
+    AnswererAnswer,
+    AnthropicAnswererClient,
+    Source,
+    collect_answers,
     collect_ballots,
+    create_member,
     run_committee_workflow,
     visible_conversation,
 )
+from committee_agent.anthropic import AnthropicAnswererModel
 from committee_agent.committee import Candidate
 from google.adk.agents.context import Context
+from google.adk.models import Gemini
+from google.adk.models.lite_llm import LiteLlm
+from google.adk.models.llm_request import LlmRequest
+from google.adk.tools import google_search, url_context
 from google.genai import types
+from litellm.types.utils import ModelResponse
+from pydantic import ValidationError
 
 
 def text_event(author: str, text: str, isolation_scope: str | None = None) -> SimpleNamespace:
@@ -49,7 +62,7 @@ def test_visible_conversation_excludes_internal_events_and_agent_names() -> None
 def test_ranking_payloads_contain_no_model_ids() -> None:
     """Every judge must receive only shuffled candidate IDs and answer text."""
     candidates = [
-        Candidate(f"response_{index}", model_id, f"Answer {index}")
+        Candidate(f"response_{index}", model_id, f"Answer {index}", [])
         for index, model_id in enumerate(MODEL_IDS)
     ]
     payloads = []
@@ -110,3 +123,661 @@ def test_committee_workflow_flushes_langfuse_after_failure(monkeypatch) -> None:
 
     assert fake_langfuse.inputs == [{"question": "Current question"}]
     assert fake_langfuse.flush_count == 1
+
+
+@pytest.mark.parametrize(
+    ("model_id", "expected_route", "expected_args"),
+    [
+        (
+            "openai/gpt-5.6-sol",
+            "openai/responses/gpt-5.6-sol",
+            {
+                "reasoning_effort": "none",
+                "extra_body": {"tools": [{"type": "web_search", "search_context_size": "low"}]},
+            },
+        ),
+        (
+            "anthropic/claude-fable-5",
+            "anthropic/claude-fable-5",
+            {"web_search_options": {"search_context_size": "low"}},
+        ),
+        (
+            "gemini/gemini-3.1-pro-preview",
+            "gemini/gemini-3.1-pro-preview",
+            {"web_search_options": {"search_context_size": "low"}},
+        ),
+    ],
+)
+def test_answerer_models_use_provider_native_search(
+    model_id: str,
+    expected_route: str,
+    expected_args: dict,
+) -> None:
+    """Each answerer gets its exact provider-native hosted search configuration."""
+    member = create_member(0, model_id)
+    answerer_model = member.answerer.model
+
+    if model_id.startswith("gemini/"):
+        assert isinstance(answerer_model, Gemini)
+        assert answerer_model.model == "gemini-3.1-pro-preview"
+        assert member.answerer.tools == [google_search, url_context]
+        assert member.answerer.generate_content_config == types.GenerateContentConfig(
+            tool_config=types.ToolConfig(include_server_side_tool_invocations=True)
+        )
+    else:
+        assert isinstance(answerer_model, LiteLlm)
+        assert answerer_model.model == expected_route
+        assert all(
+            answerer_model._additional_args.get(key) == value
+            for key, value in expected_args.items()
+        )
+        assert "include" not in answerer_model._additional_args
+        assert member.answerer.tools == []
+
+
+def test_search_isolated_to_answerer_models() -> None:
+    """Rankers and synthesizers stay search-free and use another model object."""
+    for index, model_id in enumerate(MODEL_IDS):
+        member = create_member(index, model_id)
+        answerer_model = member.answerer.model
+        ranker_model = member.ranker.model
+        synthesizer_model = member.synthesizer.model
+
+        assert answerer_model is not ranker_model
+        assert answerer_model is not synthesizer_model
+        assert ranker_model is synthesizer_model
+        if model_id.startswith("gemini/"):
+            assert isinstance(ranker_model, Gemini)
+            assert ranker_model.model == "gemini-3.1-pro-preview"
+        else:
+            assert isinstance(ranker_model, LiteLlm)
+            assert ranker_model._additional_args == {}
+        assert member.ranker.tools == []
+        assert member.synthesizer.tools == []
+
+
+def test_answerer_and_synthesizer_instructions_require_markdown_citations() -> None:
+    """Search and descriptive Markdown citation requirements remain explicit."""
+    member = create_member(0, MODEL_IDS[0])
+    answerer_instruction = cast(str, member.answerer.instruction)
+    synthesizer_instruction = cast(str, member.synthesizer.instruction)
+
+    assert "provider-native web search" in answerer_instruction
+    assert "descriptive Markdown links" in answerer_instruction
+    assert "bare URL" in answerer_instruction
+    assert "preserve useful source links" in synthesizer_instruction
+    assert "descriptive Markdown links" in synthesizer_instruction
+    assert "bare URL" in synthesizer_instruction
+    ranker_instruction = cast(str, member.ranker.instruction)
+    assert "provider-native web search" in ranker_instruction
+    assert "relevance" in ranker_instruction
+    assert "quality" in ranker_instruction
+    assert "snippet" in ranker_instruction
+    assert member.answerer.output_schema is AnswererAnswer
+    assert member.synthesizer.output_schema is Answer
+
+
+def test_all_answerer_instructions_prohibit_intermediate_search_output() -> None:
+    """Every provider answerer emits only tool calls before one final result."""
+    for model_id in MODEL_IDS:
+        instruction = cast(str, create_member(0, model_id).answerer.instruction)
+        assert "only provider-owned tool calls" in instruction
+        assert "intermediate answer text" in instruction
+        assert "search-query JSON" in instruction
+        assert "partial structured output" in instruction
+        assert "exactly one final AnswererAnswer" in instruction
+        assert "After all tool use is complete" in instruction
+
+
+def test_anthropic_client_forces_targeted_request_to_non_streaming() -> None:
+    """The targeted hosted-search request forwards exactly one completed call."""
+    captured = {}
+    calls = []
+    intermediate_query = {"query": "latest"}
+    with pytest.raises(ValueError):
+        AnswererAnswer.model_validate(intermediate_query)
+
+    class FakeClient(AnthropicAnswererClient):
+        async def _provider_acompletion(self, model, messages, tools, **kwargs):
+            calls.append(1)
+            captured.update(model=model, messages=messages, tools=tools, kwargs=kwargs)
+            return ModelResponse(
+                model=model,
+                choices=[
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": '{"answer":"Final","sources":[]}',
+                            "tool_calls": [
+                                {
+                                    "type": "function",
+                                    "id": "search-1",
+                                    "function": {
+                                        "name": "web_search",
+                                        "arguments": '{"query":"latest"}',
+                                    },
+                                },
+                                {
+                                    "type": "function",
+                                    "id": "other-1",
+                                    "function": {
+                                        "name": "lookup",
+                                        "arguments": '{"key":"value"}',
+                                    },
+                                },
+                            ],
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+            )
+
+    result = asyncio.run(
+        FakeClient().acompletion(
+            model="anthropic/claude-fable-5",
+            messages=[{"role": "user", "content": "Question"}],
+            tools=[],
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "AnswererAnswer",
+                    "strict": True,
+                    "schema": {"type": "object", "required": ["answer", "sources"]},
+                },
+            },
+            web_search_options={"search_context_size": "low"},
+            sentinel="preserved",
+            stream=True,
+        )
+    )
+
+    assert len(calls) == 1
+    assert captured["kwargs"]["stream"] is False
+    assert captured["kwargs"]["sentinel"] == "preserved"
+    assert "response_format" not in captured["kwargs"]
+    assert captured["kwargs"]["output_config"] == {
+        "format": {
+            "type": "json_schema",
+            "schema": {"type": "object", "required": ["answer", "sources"]},
+        }
+    }
+    assert result.choices[0].message.content == '{"answer":"Final","sources":[]}'
+    assert [call.function.name for call in result.choices[0].message.tool_calls] == ["lookup"]
+
+
+def test_anthropic_client_preserves_application_web_search_calls() -> None:
+    """An application-owned web_search call is not mistaken for hosted search."""
+
+    class FakeClient(AnthropicAnswererClient):
+        async def _provider_acompletion(self, model, messages, tools, **kwargs):
+            return ModelResponse(
+                model=model,
+                choices=[
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": '{"query":"application"}',
+                            "tool_calls": [
+                                {
+                                    "type": "function",
+                                    "id": "app-search",
+                                    "function": {
+                                        "name": "web_search",
+                                        "arguments": '{"query":"application"}',
+                                    },
+                                }
+                            ],
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+            )
+
+    result = asyncio.run(
+        FakeClient().acompletion(
+            model="anthropic/claude-fable-5",
+            messages=[],
+            tools=[{"type": "function", "function": {"name": "web_search"}}],
+            response_format={
+                "type": "json_schema",
+                "json_schema": {"schema": {"type": "object"}},
+            },
+            web_search_options={"search_context_size": "low"},
+        )
+    )
+
+    assert result.choices[0].message.tool_calls[0].function.name == "web_search"
+
+
+def test_anthropic_non_target_request_is_delegated_unchanged() -> None:
+    """Requests outside the answerer activation matrix retain all arguments."""
+    captured = {}
+
+    class FakeClient(AnthropicAnswererClient):
+        async def _provider_acompletion(self, model, messages, tools, **kwargs):
+            captured.update(model=model, messages=messages, tools=tools, kwargs=kwargs)
+            return "response"
+
+    marker = {"type": "json_object"}
+    result = asyncio.run(
+        FakeClient().acompletion(
+            model="anthropic/other-model",
+            messages=["message"],
+            tools=["tool"],
+            response_format=marker,
+            stream=True,
+            sentinel="preserved",
+        )
+    )
+
+    assert result == "response"
+    assert captured == {
+        "model": "anthropic/other-model",
+        "messages": ["message"],
+        "tools": ["tool"],
+        "kwargs": {
+            "response_format": marker,
+            "stream": True,
+            "sentinel": "preserved",
+        },
+    }
+
+
+def test_anthropic_answerer_emits_one_completed_response_for_streaming_request(
+    monkeypatch,
+) -> None:
+    """The adapter yields one final response instead of an intermediate query."""
+    member = create_member(0, "anthropic/claude-fable-5")
+    model = cast(AnthropicAnswererModel, member.answerer.model)
+    client = cast(AnthropicAnswererClient, model.llm_client)
+    response = ModelResponse(
+        model="anthropic/claude-fable-5",
+        choices=[
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": '{"answer":"Final","sources":[]}',
+                },
+                "finish_reason": "stop",
+            }
+        ],
+    )
+
+    async def fake_completion(*_args, **_kwargs):
+        return response
+
+    monkeypatch.setattr(client, "_provider_acompletion", fake_completion)
+    request = LlmRequest(
+        model="anthropic/claude-fable-5",
+        contents=[types.Content(role="user", parts=[types.Part.from_text(text="Question")])],
+    )
+    request.set_output_schema(AnswererAnswer)
+
+    async def collect_responses():
+        return [response async for response in model.generate_content_async(request, stream=True)]
+
+    results = asyncio.run(collect_responses())
+
+    assert len(results) == 1
+    assert results[0].partial is False
+    assert results[0].turn_complete is True
+    assert AnswererAnswer.model_validate_json(results[0].content.parts[0].text).answer == "Final"
+
+
+def test_anthropic_malformed_final_response_is_not_repaired(monkeypatch) -> None:
+    """A malformed completed answer remains a schema validation failure."""
+    member = create_member(0, "anthropic/claude-fable-5")
+    model = cast(AnthropicAnswererModel, member.answerer.model)
+    client = cast(AnthropicAnswererClient, model.llm_client)
+    response = ModelResponse(
+        model="anthropic/claude-fable-5",
+        choices=[
+            {
+                "message": {"role": "assistant", "content": '{"query":"still malformed"}'},
+                "finish_reason": "stop",
+            }
+        ],
+    )
+
+    async def fake_completion(*_args, **_kwargs):
+        return response
+
+    monkeypatch.setattr(client, "_provider_acompletion", fake_completion)
+    request = LlmRequest(
+        model="anthropic/claude-fable-5",
+        contents=[types.Content(role="user", parts=[types.Part.from_text(text="Question")])],
+    )
+    request.set_output_schema(AnswererAnswer)
+
+    async def collect_responses():
+        return [item async for item in model.generate_content_async(request, stream=True)]
+
+    result = asyncio.run(collect_responses())
+    content = result[0].content.parts[0].text
+    with pytest.raises(ValueError):
+        AnswererAnswer.model_validate_json(content)
+
+
+def test_collect_answers_preserves_cited_answer_text() -> None:
+    """Collection keeps the complete structured answer, including source links."""
+    cited_answers = [
+        AnswererAnswer(
+            answer="[Official source](https://example.com/one)",
+            sources=[
+                Source(url="https://example.com/one", title="One", snippet="First"),
+                Source(url="https://example.com/one", title="One duplicate", snippet="Second"),
+            ],
+        ),
+        AnswererAnswer(
+            answer="[Reference source](https://example.com/two)",
+            sources=[Source(url="https://example.com/two", title="Two", snippet="Second")],
+        ),
+        AnswererAnswer(
+            answer="[Primary source](https://example.com/three)",
+            sources=[],
+        ),
+    ]
+
+    class FakeContext:
+        async def run_node(self, member, _payload, run_id):
+            index = int(run_id.rsplit("_", 1)[1])
+            assert member is agent_module.MEMBERS[index].answerer
+            return cited_answers[index].model_dump()
+
+    answers = asyncio.run(
+        collect_answers(
+            cast(Context, FakeContext()),
+            {"current_question": "Question", "conversation_history": []},
+        )
+    )
+
+    assert list(answers.values()) == cited_answers
+
+
+def test_collect_ballots_serializes_ordered_sources_without_provider_metadata() -> None:
+    """Ranker payloads contain only exact provider-neutral source dictionaries."""
+    sources = [
+        Source(url="HTTPS://Example.com/one?b=2&a=1", title="First", snippet="One"),
+        Source(url="https://example.com/two#fragment", title="Second", snippet="Two"),
+        Source(url="HTTPS://Example.com/one?b=2&a=1", title="First", snippet="One"),
+    ]
+    candidates = [
+        Candidate(
+            candidate_id="response_a",
+            model="openai/gpt-5.6-sol",
+            answer="[One](https://example.com/one)",
+            sources=sources,
+        )
+    ]
+    payloads = []
+
+    class FakeContext:
+        async def run_node(self, _agent, payload, run_id):
+            payloads.append((run_id, payload))
+            return {"candidate_ids": ["response_a"], "reasoning": "Supported."}
+
+    ballots = asyncio.run(
+        collect_ballots(
+            cast(Context, FakeContext()),
+            {"current_question": "Question", "conversation_history": []},
+            candidates,
+            random.Random(3),
+        )
+    )
+
+    assert ballots == [["response_a"]] * len(agent_module.MEMBERS)
+    for _run_id, payload in payloads:
+        assert payload["candidates"] == [
+            {
+                "candidate_id": "response_a",
+                "answer": "[One](https://example.com/one)",
+                "sources": [source.model_dump() for source in sources],
+            }
+        ]
+        serialized = json.dumps(payload)
+        assert "openai/gpt-5.6-sol" not in serialized
+        assert "member_0_answerer" not in serialized
+
+
+class AuthenticationFailureError(Exception):
+    """Synthetic provider authentication failure."""
+
+
+class RateLimitFailureError(Exception):
+    """Synthetic provider rate-limit failure."""
+
+
+class NetworkFailureError(Exception):
+    """Synthetic provider network failure."""
+
+
+class ProviderApiFailureError(Exception):
+    """Synthetic provider API failure."""
+
+
+FAILURE_CASES = (
+    pytest.param("authentication", AuthenticationFailureError("invalid credentials"), id="auth"),
+    pytest.param("rate_limit", RateLimitFailureError("quota exhausted"), id="rate-limit"),
+    pytest.param("network", NetworkFailureError("connection lost"), id="network"),
+    pytest.param(
+        "provider_api",
+        ProviderApiFailureError("provider unavailable"),
+        id="provider-api",
+    ),
+    pytest.param("malformed", None, id="malformed-structured-response"),
+)
+
+
+def assert_search_enabled_answerer(member, model_id: str) -> None:
+    """Assert a member uses the configured provider-native answerer model."""
+    model = member.answerer.model
+    if model_id.startswith("gemini/"):
+        assert isinstance(model, Gemini)
+        assert model.model == "gemini-3.1-pro-preview"
+        assert member.answerer.tools == [google_search, url_context]
+        return
+
+    assert isinstance(model, LiteLlm)
+    expected_route = "openai/responses/gpt-5.6-sol" if model_id == MODEL_IDS[0] else model_id
+
+    assert model.model == expected_route
+    if model_id == MODEL_IDS[0]:
+        assert model._additional_args == {
+            "reasoning_effort": "none",
+            "extra_body": {
+                "tools": [{"type": "web_search", "search_context_size": "low"}],
+            },
+        }
+    else:
+        assert model._additional_args == {
+            "web_search_options": {"search_context_size": "low"},
+        }
+
+
+@pytest.mark.parametrize(("model_index", "model_id"), enumerate(MODEL_IDS))
+@pytest.mark.parametrize(("failure_class", "failure"), FAILURE_CASES)
+def test_provider_failures_never_fall_back_or_start_downstream_nodes(
+    monkeypatch,
+    model_index: int,
+    model_id: str,
+    failure_class: str,
+    failure: Exception | None,
+) -> None:
+    """Every provider failure stays explicit without fallback, ranking, or synthesis."""
+    calls = []
+    downstream_calls = []
+
+    class FakeContext:
+        session = SimpleNamespace(id="session-1", events=[])
+
+        async def run_node(self, workflow_agent, _payload, run_id):
+            if run_id.startswith("answer_"):
+                answer_index = int(run_id.rsplit("_", 1)[1])
+                member = agent_module.MEMBERS[answer_index]
+                assert workflow_agent is member.answerer
+                assert_search_enabled_answerer(member, MODEL_IDS[answer_index])
+                calls.append((answer_index, workflow_agent))
+                if answer_index == model_index:
+                    if failure_class == "malformed":
+                        return {"answer": "Missing required sources"}
+                    raise cast(Exception, failure)
+                return {"answer": f"Answer {answer_index}", "sources": []}
+            downstream_calls.append(run_id)
+            raise AssertionError(f"Unexpected downstream call: {run_id}")
+
+    monkeypatch.setattr(agent_module, "propagate_attributes", lambda **_kwargs: nullcontext())
+    monkeypatch.setattr(agent_module.langfuse, "update_current_span", lambda **_kwargs: None)
+    monkeypatch.setattr(agent_module.langfuse, "flush", lambda: None)
+
+    if failure_class == "malformed":
+        expected_exception = pytest.raises(ValidationError)
+    else:
+        expected_exception = pytest.raises(type(cast(Exception, failure)))
+
+    with expected_exception as captured:
+        asyncio.run(
+            run_committee_workflow(
+                cast(Context, FakeContext()),
+                types.Content(parts=[types.Part(text="Question")]),
+            )
+        )
+
+    assert [index for index, _answerer in calls].count(model_index) == 1
+    assert len(calls) == len(MODEL_IDS)
+    assert len({id(answerer) for _index, answerer in calls}) == len(MODEL_IDS)
+    if failure is not None:
+        assert captured.value is failure
+    assert downstream_calls == []
+
+
+def test_gemini_empty_sources_without_tool_invocation_reaches_synthesis(monkeypatch) -> None:
+    """Gemini may return no sources while the committee still ranks and synthesizes."""
+    calls = []
+    synthesis_payload = {}
+
+    class FakeContext:
+        session = SimpleNamespace(id="session-1", events=[])
+
+        async def run_node(self, workflow_agent, payload, run_id):
+            calls.append(run_id)
+            if run_id.startswith("answer_"):
+                answer_index = int(run_id.rsplit("_", 1)[1])
+                member = agent_module.MEMBERS[answer_index]
+                assert workflow_agent is member.answerer
+                assert_search_enabled_answerer(member, MODEL_IDS[answer_index])
+                answer = "Gemini answer without tool invocation"
+                if answer_index != 1:
+                    answer = f"Answer {answer_index}"
+                return {"answer": answer, "sources": []}
+            if run_id.startswith("ranking_"):
+                return {
+                    "candidate_ids": [
+                        candidate["candidate_id"] for candidate in payload["candidates"]
+                    ],
+                    "reasoning": "Valid empty-source answer.",
+                }
+            assert run_id == "synthesis"
+            synthesis_payload.update(payload)
+            return {"answer": "Final answer"}
+
+    monkeypatch.setattr(agent_module, "propagate_attributes", lambda **_kwargs: nullcontext())
+    monkeypatch.setattr(agent_module.langfuse, "update_current_span", lambda **_kwargs: None)
+    monkeypatch.setattr(agent_module.langfuse, "flush", lambda: None)
+
+    result = asyncio.run(
+        run_committee_workflow(
+            cast(Context, FakeContext()),
+            types.Content(parts=[types.Part(text="Question")]),
+        )
+    )
+
+    assert result == "Final answer"
+    assert calls[:3] == ["answer_0", "answer_1", "answer_2"]
+    assert set(calls[3:6]) == {"ranking_0", "ranking_1", "ranking_2"}
+    assert calls[6:] == ["synthesis"]
+    gemini_candidates = [
+        candidate
+        for candidate in synthesis_payload["candidate_answers"]
+        if candidate["answer"] == "Gemini answer without tool invocation"
+    ]
+    assert gemini_candidates == [
+        {
+            "candidate_id": gemini_candidates[0]["candidate_id"],
+            "answer": "Gemini answer without tool invocation",
+            "sources": [],
+        }
+    ]
+
+
+def test_synthesis_receives_all_anonymous_citations_and_returns_them(monkeypatch) -> None:
+    """Synthesis receives cited text without model identity and preserves final output."""
+    cited_answers = [
+        "[Official source](https://example.com/one)",
+        "[Reference source](https://example.com/two)",
+        "[Primary source](https://example.com/three)",
+    ]
+    final_answer = "[Best source](https://example.com/final)"
+    captured_payload = {}
+
+    async def fake_collect_answers(_ctx, _payload):
+        return dict(
+            zip(
+                (member.model_id for member in agent_module.MEMBERS),
+                [
+                    AnswererAnswer(
+                        answer=answer,
+                        sources=[
+                            Source(
+                                url=f"https://example.com/{index}",
+                                title=f"Source {index}",
+                                snippet=f"Snippet {index}",
+                            )
+                        ],
+                    )
+                    for index, answer in enumerate(cited_answers)
+                ],
+                strict=True,
+            )
+        )
+
+    async def fake_collect_ballots(_ctx, _payload, candidates, _rng):
+        return [[candidate.candidate_id for candidate in candidates] for _ in agent_module.MEMBERS]
+
+    class FakeContext:
+        session = SimpleNamespace(id="session-1", events=[])
+
+        async def run_node(self, member, payload, run_id):
+            assert run_id == "synthesis"
+            assert member in [
+                committee_member.synthesizer for committee_member in agent_module.MEMBERS
+            ]
+            captured_payload.update(payload)
+            return {"answer": final_answer}
+
+    monkeypatch.setattr(agent_module, "collect_answers", fake_collect_answers)
+    monkeypatch.setattr(agent_module, "collect_ballots", fake_collect_ballots)
+    monkeypatch.setattr(agent_module, "propagate_attributes", lambda **_kwargs: nullcontext())
+    monkeypatch.setattr(agent_module.langfuse, "update_current_span", lambda **_kwargs: None)
+    monkeypatch.setattr(agent_module.langfuse, "flush", lambda: None)
+
+    result = asyncio.run(
+        run_committee_workflow(
+            cast(Context, FakeContext()),
+            types.Content(parts=[types.Part(text="Question")]),
+        )
+    )
+
+    assert result == final_answer
+    candidate_answers = captured_payload["candidate_answers"]
+    assert {candidate["answer"] for candidate in candidate_answers} == set(cited_answers)
+    assert all(
+        set(source) == {"url", "title", "snippet"}
+        for candidate in candidate_answers
+        for source in candidate["sources"]
+    )
+    assert {
+        source["url"] for candidate in candidate_answers for source in candidate["sources"]
+    } == {f"https://example.com/{index}" for index in range(len(cited_answers))}
+    serialized = json.dumps(candidate_answers)
+    assert all(model_id not in serialized for model_id in MODEL_IDS)
+    assert all(member.answerer.name not in serialized for member in agent_module.MEMBERS)
