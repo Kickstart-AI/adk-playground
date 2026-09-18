@@ -2,6 +2,7 @@
 
 import asyncio
 
+from agent_utils.conversation import ConversationHistoryCallback
 from google.adk import Workflow
 from google.adk.agents import context
 from google.adk.agents.llm_agent import Agent
@@ -50,6 +51,8 @@ planner_agent = Agent(
         "subtasks appropriate to the topic complexity."
     ),
     output_schema=ResearchPlan,
+    include_contents="none",
+    before_model_callback=ConversationHistoryCallback({"user", "deep_research_agent"}),
 )
 
 researcher_agent = Agent(
@@ -96,22 +99,9 @@ async def deep_research_workflow(ctx: context.Context, node_input) -> str:
             metadata={"workflow": "planner-researcher-writer"},
         )
         try:
-            # ADK single-turn workflow nodes do not receive chat history.
-            history = [
-                {
-                    "author": event.author,
-                    "text": "\n".join(part.text for part in event.content.parts or [] if part.text),
-                }
-                for event in ctx.session.events
-                if event.content and event.author in {"user", "Planner_Agent", "Writer_Agent"}
-            ]
-
             plan = await ctx.run_node(
                 planner_agent,
-                {
-                    "conversation_history": history,
-                    "current_request": node_input.model_dump(),
-                },
+                {"task": "Plan the deep-research workflow for the latest user request."},
             )
             plan = ResearchPlan.model_validate(plan)
             if not plan.ready_to_research:
@@ -120,7 +110,10 @@ async def deep_research_workflow(ctx: context.Context, node_input) -> str:
             research_tasks = [
                 ctx.run_node(
                     researcher_agent,
-                    {"research_goal": plan.research_goal, "subtask": subtask},
+                    {
+                        "research_goal": plan.research_goal,
+                        "subtask": subtask,
+                    },
                     run_id=f"research-{index}",
                 )
                 for index, subtask in enumerate(plan.subtasks)
