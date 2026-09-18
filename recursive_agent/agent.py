@@ -5,7 +5,8 @@ from __future__ import annotations
 import logging
 from typing import Literal
 
-from google.adk import Context, Workflow
+from agent_utils.conversation import ConversationHistoryCallback
+from google.adk import Workflow
 from google.adk import tools as adk_tools
 from google.adk.agents import LlmAgent, context
 from google.adk.agents.llm_agent import Agent
@@ -21,9 +22,10 @@ GoogleADKInstrumentor().instrument()
 MODEL = "gemini-3.5-flash"
 
 COMMON_AGENT_INSTRUCTION = (
-    "You are part of a recursive agent workflow. Every turn you receive two inputs: "
-    "`conversation_history` (prior turns) and `current_request` (the latest user "
-    "message).\n\n"
+    "You are part of a recursive agent workflow. Every turn you receive the latest "
+    "user request in the supplied conversation history. If the task payload includes "
+    "`rewritten_request`, use it as a refinement of that request without changing "
+    "the user's intent.\n\n"
     "You must choose exactly one outcome:\n"
     "1. ANSWER DIRECTLY: set `direct_answer` to your best response when you can answer "
     "well enough or no further prompt rewrite would materially improve the result.\n"
@@ -136,6 +138,8 @@ initial_agent = Agent(
         "result."
     ),
     output_schema=AgentResponseSchema,
+    include_contents="none",
+    before_model_callback=ConversationHistoryCallback({"user", "recursive_agent"}),
 )
 
 
@@ -165,11 +169,10 @@ async def recursive_workflow(ctx: context.Context, node_input) -> str:
             if session_id not in state:
                 state[session_id] = {"current_agent": initial_agent, "iteration": 0}
 
-            history = await extract_history(ctx)
-
             recursion_limit = 5
             i = 0
-            current_request = node_input.model_dump(exclude_none=True)
+            original_request = "".join(part.text or "" for part in node_input.parts or [])
+            rewritten_request = None
             fallback_answer = "I could not produce a final answer within the recursion limit."
             while i < recursion_limit:
                 i += 1
@@ -177,8 +180,8 @@ async def recursive_workflow(ctx: context.Context, node_input) -> str:
                 agent_response_dict = await ctx.run_node(
                     state[session_id]["current_agent"],
                     {
-                        "conversation_history": history,
-                        "current_request": current_request,
+                        "task": "Answer the latest user request or improve the agent.",
+                        **({"rewritten_request": rewritten_request} if rewritten_request else {}),
                     },
                 )
 
@@ -204,7 +207,12 @@ async def recursive_workflow(ctx: context.Context, node_input) -> str:
                 else:
                     return "I could not produce an answer."
 
-                current_request = agent_response.user_prompt or current_request
+                if agent_response.user_prompt:
+                    rewritten_request = (
+                        agent_response.user_prompt
+                        if agent_response.user_prompt.strip() != original_request.strip()
+                        else None
+                    )
 
                 state[session_id]["iteration"] += 1
                 iteration = state[session_id]["iteration"]
@@ -230,6 +238,8 @@ async def construct_agent(agent_schema: AgentSchema, iteration) -> LlmAgent:
     agent_kwargs["name"] = f"Agent_{iteration}"
     agent_kwargs["instruction"] = COMMON_AGENT_INSTRUCTION + "\n\n" + agent_kwargs["instruction"]
     agent_kwargs["output_schema"] = AgentResponseSchema
+    agent_kwargs["include_contents"] = "none"
+    agent_kwargs["before_model_callback"] = ConversationHistoryCallback({"user", "recursive_agent"})
     agent_kwargs = construct_agent_kwargs(agent_kwargs)
     new_agent = Agent(**agent_kwargs)
     return new_agent
@@ -252,25 +262,16 @@ def construct_agent_kwargs(agent_kwargs: dict) -> dict:
     if agent_kwargs.get("sub_agents"):
         sub_agents = []
         for sub_agent_kwargs in agent_kwargs.pop("sub_agents"):
+            sub_agent_kwargs["include_contents"] = "none"
+            sub_agent_kwargs["before_model_callback"] = ConversationHistoryCallback(
+                {"user", "recursive_agent"}
+            )
             sub_agent = Agent(**construct_agent_kwargs(sub_agent_kwargs))
             sub_agents.append(adk_tools.AgentTool(sub_agent))
         if "tools" not in agent_kwargs:
             agent_kwargs["tools"] = []
         agent_kwargs["tools"].extend(sub_agents)
     return agent_kwargs
-
-
-async def extract_history(ctx: Context) -> list[dict[str, str]]:
-    history = []
-    for event in ctx.session.events:
-        content = None
-        if event.content and event.author == "user":
-            content = "\n".join(part.text for part in event.content.parts or [] if part.text)
-        elif event.output and event.author == "recursive_agent":
-            content = event.output
-        if content:
-            history.append({"author": event.author, "text": content})
-    return history
 
 
 root_agent = Workflow(

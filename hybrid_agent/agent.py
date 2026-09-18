@@ -3,6 +3,7 @@
 import logging
 import pathlib
 
+from agent_utils.conversation import ConversationHistoryCallback
 from google.adk.agents import LlmAgent
 from google.adk.agents.context import Context
 from google.adk.events.event import Event
@@ -28,6 +29,7 @@ GoogleADKInstrumentor().instrument()
 MODEL = "gemini-3.5-flash"
 FLOWS_PATH = pathlib.Path(__file__).parent / "agent_flows.yaml"
 CONFIG = load_config(FLOWS_PATH)
+HISTORY_CALLBACK = ConversationHistoryCallback({"user", "hybrid_agent"})
 
 speaker = LlmAgent(
     name="speaker",
@@ -49,6 +51,8 @@ speaker = LlmAgent(
         "Always write in the language the user uses in the transcript."
     ),
     output_schema=SpeakerResponse,
+    include_contents="none",
+    before_model_callback=HISTORY_CALLBACK,
 )
 
 reflector = LlmAgent(
@@ -63,6 +67,8 @@ reflector = LlmAgent(
         "user message matches current_flow."
     ),
     output_schema=Verdict,
+    include_contents="none",
+    before_model_callback=HISTORY_CALLBACK,
 )
 
 option_selector = LlmAgent(
@@ -78,6 +84,8 @@ option_selector = LlmAgent(
         "user message matches current_flow. Never guess."
     ),
     output_schema=OptionSelection,
+    include_contents="none",
+    before_model_callback=HISTORY_CALLBACK,
 )
 
 extractors = {
@@ -93,6 +101,8 @@ extractors = {
             "current_flow."
         ),
         output_schema=args_model,
+        include_contents="none",
+        before_model_callback=HISTORY_CALLBACK,
     )
     for tool_name, (_, args_model) in TOOLS.items()
 }
@@ -110,6 +120,8 @@ intake_agent = LlmAgent(
         "Always write in the language the user uses in the transcript."
     ),
     output_schema=IntakeResponse,
+    include_contents="none",
+    before_model_callback=HISTORY_CALLBACK,
 )
 
 INTERNAL_AGENTS = {
@@ -145,42 +157,13 @@ INTAKE_RESET = {
 }
 
 
-def conversation_transcript(ctx: Context) -> list[dict]:
-    """Reconstruct the user-visible dialogue from the session events."""
-    lines = []
-    for event in ctx.session.events:
-        # Internal LLM-node inputs are appended as user-authored events with an
-        # isolation scope; skip them so payload JSON doesn't leak into the transcript.
-        internal = event.author not in ["user", "hybrid_agent"] or event.isolation_scope
-        if internal or not event.content:
-            continue
-        for part in event.content.parts or []:
-            text = (part.text or "").strip()
-            if text.startswith("{"):
-                # Internal LLM-node inputs are appended to the session as user-authored
-                # events carrying our JSON payloads; keep them out of the transcript.
-                continue
-            if text:
-                lines.append({"author": event.author, "text": text})
-            elif part.function_call and part.function_call.name == "adk_request_input":
-                lines.append(
-                    {"author": event.author, "text": (part.function_call.args or {}).get("message")}
-                )
-            elif part.function_response and part.function_response.name == "adk_request_input":
-                reply = (part.function_response.response or {}).get("result")
-                lines.append({"author": event.author, "text": str(reply)})
-    return lines
-
-
 def speaker_response_of(output: dict) -> SpeakerResponse:
     """Parse structured speaker output from an LLM node."""
     return SpeakerResponse(**output)
 
 
 async def run_speaker(ctx: Context, payload: dict, run_id: str) -> SpeakerResponse:
-    """Run the speaker with transcript context guaranteed."""
-    if "transcript" not in payload:
-        payload = {**payload, "transcript": conversation_transcript(ctx)}
+    """Run the speaker with conversation history supplied by its callback."""
     return speaker_response_of(await ctx.run_node(speaker, payload, run_id=run_id))
 
 
@@ -398,7 +381,7 @@ async def run_tool_action(run_id: str, action: Action, ctx: Context, memo: dict)
 async def run_action(step: Step, index: int, action: Action, ctx: Context, memo: dict):
     """Run one action; return an Event that ends the step, or None to continue.
 
-    memo holds the shared "transcript" and "facts" passed to the LLM calls.
+    memo holds shared workflow facts passed to the LLM calls.
     """
     run_id = f"{step.name}:{index}"
     if action.message is not None:
@@ -433,7 +416,6 @@ async def execute_step(step: Step, ctx: Context) -> Event:
     facts = dict(ctx.state.get("facts", {}))
     flow = FLOW_BY_STEP[step.name]
     memo = {
-        "transcript": conversation_transcript(ctx),
         "facts": facts,
         "current_flow": flow.name,
         "current_flow_description": flow.description,
@@ -503,7 +485,7 @@ def make_step_node(step: Step) -> FunctionNode:
             response = IntakeResponse(
                 **await ctx.run_node(
                     intake_agent,
-                    {"transcript": conversation_transcript(ctx)},
+                    {},
                     run_id=f"{step.name}:fallback",
                 )
             )
@@ -519,14 +501,13 @@ async def intake(ctx: Context, node_input):
     intake must not re-route in the same turn — deterministic re-triage of an
     unchanged transcript loops forever. It informs the user and ends the turn.
     """
-    transcript = conversation_transcript(ctx)
     if isinstance(node_input, str) and node_input:
         # No flows in the payload: entered via a fail route, intake must not
         # re-route in the same turn. It explains the problem and ends the turn.
         response = IntakeResponse(
             **await ctx.run_node(
                 intake_agent,
-                {"transcript": transcript, "problem": node_input},
+                {"problem": node_input},
                 run_id="intake:fail",
             )
         )
@@ -543,9 +524,7 @@ async def intake(ctx: Context, node_input):
         for flow in FLOWS
     ]
     response = IntakeResponse(
-        **await ctx.run_node(
-            intake_agent, {"flows": menu, "transcript": transcript}, run_id="intake:triage"
-        )
+        **await ctx.run_node(intake_agent, {"flows": menu}, run_id="intake:triage")
     )
     first_steps = {flow.name: flow.steps[0].name for flow in FLOWS}
     if response.flow in first_steps:
