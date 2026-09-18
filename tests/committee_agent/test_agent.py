@@ -10,40 +10,14 @@ from typing import cast
 import committee_agent.agent as agent_module
 import pytest
 from committee_agent.agent import (
+    MEMBERS,
     MODEL_IDS,
     collect_ballots,
     run_committee_workflow,
-    visible_conversation,
 )
 from committee_agent.committee import Candidate
 from google.adk.agents.context import Context
 from google.genai import types
-
-
-def text_event(author: str, text: str, isolation_scope: str | None = None) -> SimpleNamespace:
-    """Create the event fields used by visible conversation extraction."""
-    content = SimpleNamespace(parts=[SimpleNamespace(text=text)])
-    return SimpleNamespace(author=author, content=content, isolation_scope=isolation_scope)
-
-
-def test_visible_conversation_excludes_internal_events_and_agent_names() -> None:
-    """Only visible dialogue may be forwarded, with assistant identity removed."""
-    ctx = SimpleNamespace(
-        session=SimpleNamespace(
-            events=[
-                text_event("user", "First question"),
-                text_event("member_0_answerer", "private answer", "committee/internal"),
-                text_event("committee_agent", "Visible response"),
-                text_event("user", "Follow-up question"),
-            ]
-        )
-    )
-
-    assert visible_conversation(cast(Context, ctx)) == [
-        {"role": "user", "content": "First question"},
-        {"role": "assistant", "content": "Visible response"},
-        {"role": "user", "content": "Follow-up question"},
-    ]
 
 
 def test_ranking_payloads_contain_no_model_ids() -> None:
@@ -55,8 +29,8 @@ def test_ranking_payloads_contain_no_model_ids() -> None:
     payloads = []
 
     class FakeContext:
-        async def run_node(self, _agent, payload, run_id):
-            payloads.append((run_id, payload))
+        async def run_node(self, _agent, payload, run_id, **kwargs):
+            payloads.append((run_id, payload, kwargs))
             return {
                 "candidate_ids": [candidate["candidate_id"] for candidate in payload["candidates"]],
                 "reasoning": "Test ranking.",
@@ -65,7 +39,7 @@ def test_ranking_payloads_contain_no_model_ids() -> None:
     ballots = asyncio.run(
         collect_ballots(
             cast(Context, FakeContext()),
-            {"current_question": "Question", "conversation_history": []},
+            {"task": "Answer the latest user question."},
             candidates,
             random.Random(3),
         )
@@ -74,6 +48,78 @@ def test_ranking_payloads_contain_no_model_ids() -> None:
     assert len(ballots) == len(MODEL_IDS)
     serialized = json.dumps(payloads)
     assert all(model_id not in serialized for model_id in MODEL_IDS)
+    assert [kwargs["override_isolation_scope"] for _, _, kwargs in payloads] == [
+        f"committee:ranking:{index}" for index in range(len(MODEL_IDS))
+    ]
+
+
+def test_collect_answers_scopes_each_member_call() -> None:
+    """Each independent answer call gets a private committee isolation scope."""
+    calls = []
+
+    class FakeContext:
+        async def run_node(self, _agent, _payload, run_id, **kwargs):
+            calls.append((run_id, kwargs))
+            return {"answer": f"Answer for {run_id}"}
+
+    answers = asyncio.run(
+        agent_module.collect_answers(
+            cast(Context, FakeContext()),
+            {"task": "Answer the latest user question."},
+        )
+    )
+
+    assert len(answers) == len(MODEL_IDS)
+    assert [kwargs["override_isolation_scope"] for _, kwargs in calls] == [
+        f"committee:answer:{index}" for index in range(len(MODEL_IDS))
+    ]
+
+
+def test_committee_synthesis_call_has_private_isolation_scope(monkeypatch) -> None:
+    """The final synthesis payload is isolated from other committee calls."""
+    calls = []
+
+    class FakeContext:
+        session = SimpleNamespace(id="session-1", events=[])
+
+        async def run_node(self, _agent, _payload, run_id, **kwargs):
+            calls.append((run_id, kwargs))
+            return {"answer": "Final answer"}
+
+    monkeypatch.setattr(
+        agent_module,
+        "langfuse",
+        SimpleNamespace(
+            update_current_span=lambda **_kwargs: None,
+            flush=lambda: None,
+        ),
+    )
+    monkeypatch.setattr(agent_module, "propagate_attributes", lambda **_kwargs: nullcontext())
+
+    async def fake_collect_answers(_ctx, _payload):
+        return {MEMBERS[0].model_id: "Answer"}
+
+    async def fake_collect_ballots(*_args):
+        return [["winner"]]
+
+    monkeypatch.setattr(
+        agent_module,
+        "collect_answers",
+        fake_collect_answers,
+    )
+    monkeypatch.setattr(agent_module, "collect_ballots", fake_collect_ballots)
+    monkeypatch.setattr(
+        agent_module,
+        "anonymize_answers",
+        lambda _answers, _rng: [Candidate("winner", MEMBERS[0].model_id, "Answer")],
+    )
+    monkeypatch.setattr(agent_module, "select_winner", lambda _ballots: "winner")
+
+    node_input = types.Content(parts=[types.Part(text="Current question")])
+    result = asyncio.run(run_committee_workflow(cast(Context, FakeContext()), node_input))
+
+    assert result == "Final answer"
+    assert calls == [("synthesis", {"override_isolation_scope": "committee:synthesis"})]
 
 
 def test_committee_workflow_flushes_langfuse_after_failure(monkeypatch) -> None:
@@ -90,7 +136,10 @@ def test_committee_workflow_flushes_langfuse_after_failure(monkeypatch) -> None:
         def flush(self) -> None:
             self.flush_count += 1
 
-    async def fail_collect_answers(_ctx, _payload):
+    payloads = []
+
+    async def fail_collect_answers(_ctx, payload):
+        payloads.append(payload)
         raise RuntimeError("model failure")
 
     fake_langfuse = FakeLangfuse()
@@ -110,3 +159,5 @@ def test_committee_workflow_flushes_langfuse_after_failure(monkeypatch) -> None:
 
     assert fake_langfuse.inputs == [{"question": "Current question"}]
     assert fake_langfuse.flush_count == 1
+    assert payloads == [{"task": "Answer the latest user question."}]
+    assert "Current question" not in json.dumps(payloads)
