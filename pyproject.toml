@@ -74,6 +74,8 @@ unknown-argument = "ignore"
 
 [tool.uv]
 exclude-newer = "30 days"
+# Security fixes (eMudhra CA incident) bypass the cooldown.
+exclude-newer-package = { certifi = false }
 
 [tool.deptry.package_module_name_map]
 google-adk = "google"
