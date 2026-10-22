@@ -7,13 +7,26 @@ from dataclasses import dataclass
 from google.adk import Workflow
 from google.adk.agents import LlmAgent
 from google.adk.agents.context import Context
+from google.adk.models import BaseLlm, Gemini
 from google.adk.models.lite_llm import LiteLlm
+from google.adk.tools import google_search, url_context
 from google.adk.workflow import node
+from google.genai import types
 from langfuse import get_client, observe, propagate_attributes
 from openinference.instrumentation.google_adk import GoogleADKInstrumentor
 from pydantic import BaseModel, Field
 
-from .committee import Candidate, anonymize_answers, ranking_view, select_winner
+from .anthropic import AnthropicAnswererClient, AnthropicAnswererModel
+from .committee import (
+    Candidate,
+    anonymize_answers,
+    ranking_view,
+    select_winner,
+    serialize_candidate,
+)
+from .schemas import AnswererAnswer, Source
+
+__all__ = ["Answer", "AnswererAnswer", "Source"]
 
 langfuse = get_client()
 GoogleADKInstrumentor().instrument()
@@ -52,20 +65,35 @@ class Member:
 
 def create_member(index: int, model_id: str) -> Member:
     """Create generic agents for one privately identified model."""
-    model = LiteLlm(model=model_id)
+    answerer_model = create_answerer_model(model_id)
+    model = create_model(model_id)
     model_id = model_id.replace("/", "_").replace("-", "_").replace(".", "_")
     return Member(
         model_id=model_id,
         answerer=LlmAgent(
             name=f"member_{model_id}_answerer",
-            model=model,
+            model=answerer_model,
             include_contents="none",
             instruction=(
                 "Answer the user's current question using the supplied user-visible "
-                "conversation history. Produce a complete, accurate, and useful answer. "
-                "Return only the structured answer field."
+                "conversation history. Use the provider-native web search to verify "
+                "current facts. While search is in progress, emit only provider-owned "
+                "tool calls: never emit intermediate answer text, search-query JSON, or "
+                "partial structured output. After all tool use is complete, emit exactly "
+                "one final AnswererAnswer. Cite sources inside the structured answer field "
+                "as descriptive Markdown links. Never include a bare URL. Produce a "
+                "complete, accurate, and useful answer. Return only the structured answer "
+                "and sources fields."
             ),
-            output_schema=Answer,
+            output_schema=AnswererAnswer,
+            tools=[google_search, url_context] if isinstance(answerer_model, Gemini) else [],
+            generate_content_config=(
+                types.GenerateContentConfig(
+                    tool_config=types.ToolConfig(include_server_side_tool_invocations=True)
+                )
+                if isinstance(answerer_model, Gemini)
+                else None
+            ),
         ),
         ranker=LlmAgent(
             name=f"member_{model_id}_ranker",
@@ -73,9 +101,11 @@ def create_member(index: int, model_id: str) -> Member:
             include_contents="none",
             instruction=(
                 "Rank the anonymous candidate answers by correctness, relevance, reasoning, "
-                "and usefulness. The candidates are deliberately shuffled. Do not infer or "
-                "mention who wrote them. Return every candidate ID exactly once from best "
-                "to worst."
+                "and usefulness. The supplied source objects come from provider-native web "
+                "search and must not be presumed to be hallucinated links. Judge source "
+                "relevance, source quality, and whether each snippet supports the associated "
+                "answer. The candidates are deliberately shuffled. Do not infer or mention "
+                "who wrote them. Return every candidate ID exactly once from best to worst."
             ),
             output_schema=Ranking,
         ),
@@ -86,12 +116,42 @@ def create_member(index: int, model_id: str) -> Member:
             instruction=(
                 "Write the final answer to the user using all supplied anonymous candidate "
                 "answers and their collective rankings. Reconcile disagreements and retain "
-                "the strongest viewpoints. Do not mention candidates, rankings, models, or "
-                "the committee. Return only the structured answer field."
+                "the strongest viewpoints; preserve useful source links from candidate "
+                "answers as descriptive Markdown links, and never include a bare URL. Do "
+                "not mention candidates, rankings, models, or the committee. Return only "
+                "the structured answer field."
             ),
             output_schema=Answer,
         ),
     )
+
+
+def create_model(model_id: str) -> BaseLlm:
+    """Create the native model route when ADK supports the provider."""
+    if model_id == "gemini/gemini-3.1-pro-preview":
+        return Gemini(model=model_id.removeprefix("gemini/"))
+    return LiteLlm(model=model_id)
+
+
+def create_answerer_model(model_id: str) -> BaseLlm:
+    """Create a provider-native search model for an answerer."""
+    if model_id == "openai/gpt-5.6-sol":
+        return LiteLlm(
+            model="openai/responses/gpt-5.6-sol",
+            reasoning_effort="none",
+            extra_body={
+                "tools": [{"type": "web_search", "search_context_size": "low"}],
+            },
+        )
+    if model_id == "anthropic/claude-fable-5":
+        return AnthropicAnswererModel(
+            model=model_id,
+            llm_client=AnthropicAnswererClient(),
+            web_search_options={"search_context_size": "low"},
+        )
+    if model_id == "gemini/gemini-3.1-pro-preview":
+        return create_model(model_id)
+    raise ValueError(f"Unsupported committee model: {model_id}")
 
 
 MEMBERS = tuple(create_member(index, model_id) for index, model_id in enumerate(MODEL_IDS))
@@ -126,7 +186,7 @@ def content_text(node_input) -> str:
     )
 
 
-async def collect_answers(ctx: Context, payload: dict) -> dict[str, str]:
+async def collect_answers(ctx: Context, payload: dict) -> dict[str, AnswererAnswer]:
     """Ask all committee members for independent answers in parallel."""
     responses = await asyncio.gather(
         *(
@@ -135,7 +195,7 @@ async def collect_answers(ctx: Context, payload: dict) -> dict[str, str]:
         )
     )
     return {
-        member.model_id: Answer.model_validate(response).answer
+        member.model_id: AnswererAnswer.model_validate(response)
         for member, response in zip(MEMBERS, responses, strict=True)
     }
 
@@ -150,7 +210,9 @@ async def collect_ballots(
     ranking_payloads = [
         {
             **payload,
-            "candidates": [candidate.__dict__ for candidate in ranking_view(candidates, rng)],
+            "candidates": [
+                serialize_candidate(candidate) for candidate in ranking_view(candidates, rng)
+            ],
         }
         for _ in MEMBERS
     ]
@@ -202,7 +264,8 @@ async def run_committee_workflow(ctx: Context, node_input) -> str:
                 {
                     **payload,
                     "candidate_answers": [
-                        candidate.__dict__ for candidate in ranking_view(candidates, rng)
+                        serialize_candidate(candidate)
+                        for candidate in ranking_view(candidates, rng)
                     ],
                     "collective_rankings": ballots,
                 },
