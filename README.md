@@ -7,6 +7,7 @@ A small repo for trying Google ADK Python agents.
 - [Install](#install)
 - [Directory tree](#directory-tree)
 - [Agents](#agents)
+- [Conversation history](#conversation-history)
 - [Create an agent](#create-an-agent)
 - [Authenticate with an API key](#authenticate-with-an-api-key)
 - [Set up Langfuse](#set-up-langfuse)
@@ -44,7 +45,7 @@ Python `>=3.13,<3.14` is required.
 
 ### `deep_research_agent`
 
-`deep_research_agent` is an ADK 2.0 dynamic `Workflow` agent.
+`deep_research_agent` is an ADK 2.2.0 dynamic `Workflow` agent.
 
 It is built for research tasks. The planner checks whether the request is clear
 enough to run. If not, it asks clarifying questions. If the request is clear, the
@@ -79,6 +80,15 @@ Each turn starts with a general agent that either answers directly or proposes a
 replacement agent schema. The workflow can rebuild the active agent with new
 instructions, tools, code execution, or specialist sub-agents, then retries up to
 a recursion limit before returning a final answer.
+
+## Conversation history
+
+Agents that need dialogue context use `before_model_callback` to build
+`LlmRequest.contents` from visible session events. Workflow node JSON carries only
+the current stage's task data; it should not contain `conversation_history` or
+`transcript` fields. With ADK 2.2.0, genuine Runner-created user events are kept
+even when scoped, while synthetic workflow node-input events (user-authored events
+with an empty invocation ID) and scoped internal-agent events are excluded.
 
 ## Create an agent
 

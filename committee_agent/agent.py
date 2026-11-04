@@ -4,6 +4,7 @@ import asyncio
 import random
 from dataclasses import dataclass
 
+from agent_utils.conversation import ConversationHistoryCallback
 from google.adk import Workflow
 from google.adk.agents import LlmAgent
 from google.adk.agents.context import Context
@@ -60,6 +61,7 @@ def create_member(index: int, model_id: str) -> Member:
             name=f"member_{model_id}_answerer",
             model=model,
             include_contents="none",
+            before_model_callback=ConversationHistoryCallback({"user", "committee_agent"}),
             instruction=(
                 "Answer the user's current question using the supplied user-visible "
                 "conversation history. Produce a complete, accurate, and useful answer. "
@@ -71,6 +73,7 @@ def create_member(index: int, model_id: str) -> Member:
             name=f"member_{model_id}_ranker",
             model=model,
             include_contents="none",
+            before_model_callback=ConversationHistoryCallback({"user", "committee_agent"}),
             instruction=(
                 "Rank the anonymous candidate answers by correctness, relevance, reasoning, "
                 "and usefulness. The candidates are deliberately shuffled. Do not infer or "
@@ -83,6 +86,7 @@ def create_member(index: int, model_id: str) -> Member:
             name=f"member_{model_id}_synthesizer",
             model=model,
             include_contents="none",
+            before_model_callback=ConversationHistoryCallback({"user", "committee_agent"}),
             instruction=(
                 "Write the final answer to the user using all supplied anonymous candidate "
                 "answers and their collective rankings. Reconcile disagreements and retain "
@@ -98,27 +102,6 @@ MEMBERS = tuple(create_member(index, model_id) for index, model_id in enumerate(
 MEMBER_BY_MODEL = {member.model_id: member for member in MEMBERS}
 
 
-def visible_conversation(ctx: Context) -> list[dict[str, str]]:
-    """Extract only user-visible text and hide internal agent identities."""
-    conversation = []
-    for event in ctx.session.events:
-        if event.isolation_scope:
-            continue
-        text = ""
-        if event.content:
-            text = "\n".join(
-                part.text.strip()
-                for part in event.content.parts or []
-                if part.text and part.text.strip()
-            )
-        elif event.output:
-            text = event.output
-        if text and event.author in {"user", "committee_agent"}:
-            role = "user" if event.author == "user" else "assistant"
-            conversation.append({"role": role, "content": text})
-    return conversation
-
-
 def content_text(node_input) -> str:
     """Extract text from the current ADK workflow input."""
     return "\n".join(
@@ -130,7 +113,12 @@ async def collect_answers(ctx: Context, payload: dict) -> dict[str, str]:
     """Ask all committee members for independent answers in parallel."""
     responses = await asyncio.gather(
         *(
-            ctx.run_node(member.answerer, payload, run_id=f"answer_{index}")
+            ctx.run_node(
+                member.answerer,
+                payload,
+                run_id=f"answer_{index}",
+                override_isolation_scope=f"committee:answer:{index}",
+            )
             for index, member in enumerate(MEMBERS)
         )
     )
@@ -160,6 +148,7 @@ async def collect_ballots(
                 member.ranker,
                 ranking_payload,
                 run_id=f"ranking_{index}",
+                override_isolation_scope=f"committee:ranking:{index}",
             )
             for index, (member, ranking_payload) in enumerate(
                 zip(MEMBERS, ranking_payloads, strict=True)
@@ -187,8 +176,7 @@ async def run_committee_workflow(ctx: Context, node_input) -> str:
         try:
             rng = random.SystemRandom()
             payload = {
-                "current_question": question,
-                "conversation_history": visible_conversation(ctx),
+                "task": "Answer the latest user question.",
             }
             answers = await collect_answers(ctx, payload)
             candidates = anonymize_answers(answers, rng)
@@ -207,6 +195,7 @@ async def run_committee_workflow(ctx: Context, node_input) -> str:
                     "collective_rankings": ballots,
                 },
                 run_id="synthesis",
+                override_isolation_scope="committee:synthesis",
             )
             return Answer.model_validate(synthesis).answer
         finally:

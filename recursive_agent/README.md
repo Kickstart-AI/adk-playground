@@ -68,9 +68,12 @@ keep specialist agents plain.
 ### Prompt propagation
 
 The recursive contract belongs in one common instruction that is prepended to
-top-level recursive agents. That contract explains:
+top-level recursive agents. The workflow starts each user turn with the static
+task `Answer the latest user request or improve the agent.` The shared
+`ConversationHistoryCallback` supplies the latest user request and prior visible
+turns through `LlmRequest.contents` in `before_model_callback`. The contract explains:
 
-- the inputs: `conversation_history` and `current_request`
+- the current request and the supplied message history
 - the two valid outcomes: `direct_answer` or `agent_schema`
 - the rule that both outcomes must not be populated together
 - how to use `user_prompt`
@@ -83,6 +86,23 @@ parent can decide when to call them.
 Keep the bootstrap prompt small. If it repeats the common schema and recursion
 rules, the prompt becomes harder to maintain and can drift from the actual
 Pydantic schema.
+
+Do not embed `conversation_history` or `transcript` in workflow JSON. Dynamic
+top-level agents and nested specialist agents are wired with the same callback.
+It includes only genuine user events and visible `recursive_agent` replies.
+Internal `Agent_*` responses, including generated agent definitions, do not become
+conversation history. Active tool calls and their results remain in the current
+model request.
+
+When an agent returns `user_prompt` with a replacement agent definition, the next
+iteration receives it as `rewritten_request` only if it differs from the original
+request text after trimming whitespace. An omitted rewrite retains the previous
+rewrite for the current turn. A new user turn starts with the static task again.
+The original request stays in history, so a rewrite cannot replace the user's intent.
+
+With ADK 2.2.0, it excludes synthetic user-authored node-input events with empty
+invocation IDs, retains genuine Runner user events with non-empty invocation IDs
+even when scoped, and excludes scoped internal-agent events.
 
 ### Chat sub-agents versus tool-like sub-agents
 
