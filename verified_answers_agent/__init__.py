@@ -1,1 +1,1 @@
-"""Document-grounded answers verified with Jev."""
+"""Document answers with source-match warnings and Jev support scores."""

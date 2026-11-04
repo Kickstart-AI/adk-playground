@@ -30,6 +30,7 @@ Python `>=3.13,<3.14` is required.
 ├── committee_agent/       # Anonymous multi-model answer committee
 ├── hybrid_agent/          # Flow-driven customer-service agent
 ├── recursive_agent/       # Recursive agent experiment
+├── verified_answers_agent/ # Document answers with source support scores using Jev
 ├── .agents/               # Local agent skills and supporting metadata
 ├── .adk/                  # Local ADK runtime state and artifacts
 ├── mlartifacts/           # Local MLflow/Langfuse-related artifacts
@@ -80,6 +81,16 @@ replacement agent schema. The workflow can rebuild the active agent with new
 instructions, tools, code execution, or specialist sub-agents, then retries up to
 a recursion limit before returning a final answer.
 
+### `verified_answers_agent`
+
+`verified_answers_agent` answers a question about an attached PDF or UTF-8 text
+file. Gemini 3.1 Flash-Lite with minimal thinking produces sentence–quotes pairs.
+Jev 1.14 through Cloudflare scores source support for each sentence and whether
+the joined answer sentences answer the question. All sentences remain visible,
+with per-quote source-match warnings and a punctuation-based sentence-count check.
+
+See [setup, normalization rules, and output details](verified_answers_agent/README.md).
+
 ## Create an agent
 
 Create a new agent folder:
@@ -111,6 +122,8 @@ cp .env.example my_agent/.env
 Then edit `my_agent/.env` and set `GOOGLE_API_KEY`.
 
 `committee_agent` also requires `OPENAI_API_KEY` and `ANTHROPIC_API_KEY`.
+`verified_answers_agent` also requires `CLOUDFLARE_ACCOUNT_ID` and
+`CLOUDFLARE_API_TOKEN`, plus Cloudflare credits for Jev.
 
 Commit `.env.example`. Do not commit `.env`.
 
